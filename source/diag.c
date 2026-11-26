@@ -1,0 +1,704 @@
+// SPDX-License-Identifier: MIT
+#include "diag.h"
+#include "elf_loader.h"
+#include "log.h"
+#include "trace.h"
+
+#include <stdalign.h>
+#include <stdio.h>
+#include <string.h>
+
+extern ModuleSet g_mods;
+extern volatile u32 g_open_file_count;
+extern volatile u32 g_post_aov_active;
+extern volatile u64 g_aov_tid;
+extern volatile u64 g_bad_reent_callers[8];
+extern volatile u32 g_bad_reent_count;
+
+alignas(16) u8 __nx_exception_stack[0x4000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+
+static u64 g_abort_holder[8] = {};
+static u64 g_sdk_abort_holder[8] = {};
+static alignas(16) u8 g_sdk_ex_stack[0x4000];
+static alignas(16) u8 g_sdk_ex_info[0x400];
+static bool g_sdk_ex_registered = false;
+static bool g_abort_observers_registered = false;
+
+static Thread g_hb_thread;
+static alignas(0x1000) u8 g_hb_stack[0x4000];
+static Handle g_main_thread_handle = INVALID_HANDLE;
+static u64 g_sysres_hwm = 0;
+
+#define MAX_TRACKED_WORKERS 64
+typedef struct {
+    void* thread_type;
+    Handle handle;
+    u64 tid;
+    void* fn;
+    char name[32];
+} TrackedWorker;
+static TrackedWorker g_workers[MAX_TRACKED_WORKERS] = {};
+static volatile u32 g_worker_count = 0;
+
+u64 nupStripCodePac(u64 addr) {
+    // Horizon userland VA space is 39-bit (0..0x7f_ffff_ffff); bits 39..63 carry AArch64 PAC tags.
+    return addr & ((1ULL << 39) - 1);
+}
+
+void nupFmtAddrMod(u64 addr, char* out, size_t sz) {
+    addr = nupStripCodePac(addr);
+    for (u32 i = 0; i < g_mods.count; i++) {
+        const LoadedModule* m = &g_mods.mods[i];
+        if (addr >= m->nso_base && addr < m->nso_base + m->total_size) {
+            _snprintf_r(_impure_ptr, out, sz, "%s+0x%llx", m->name, (unsigned long long)(addr - m->nso_base));
+            return;
+        }
+    }
+    _snprintf_r(_impure_ptr, out, sz, "0x%llx", (unsigned long long)addr);
+}
+
+static bool is_readable_addr(u64 addr, size_t len) {
+    if (addr < 0x10000ULL)
+        return false;
+    MemoryInfo mi = {};
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, addr)))
+        return false;
+    return (mi.perm & Perm_R) != 0 && (addr + len) <= (mi.addr + mi.size);
+}
+
+static void dump_hex_bytes(const char* label, u64 addr, size_t len) {
+    if (!is_readable_addr(addr, len)) {
+        nupLogf("  %s @ 0x%llx: <unreadable>\n", label, (unsigned long long)addr);
+        return;
+    }
+    const u8* p = (const u8*)(uintptr_t)addr;
+    for (size_t off = 0; off < len; off += 16) {
+        char line[96];
+        int pos = 0;
+        for (size_t j = 0; j < 16 && off + j < len; j++) {
+            static const char hx[] = "0123456789abcdef";
+            line[pos++] = hx[p[off + j] >> 4];
+            line[pos++] = hx[p[off + j] & 0xf];
+            line[pos++] = ' ';
+        }
+        line[pos++] = '|';
+        for (size_t j = 0; j < 16 && off + j < len; j++) {
+            u8 c = p[off + j];
+            line[pos++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        line[pos] = '\0';
+        nupLogf("  %s+0x%02zx: %s\n", label, off, line);
+    }
+}
+
+void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+    char pc_s[64], lr_s[64];
+    nupFmtAddrMod(ctx->pc.x, pc_s, sizeof(pc_s));
+    nupFmtAddrMod(ctx->lr.x, lr_s, sizeof(lr_s));
+    nupLogf("!!! EXCEPTION: desc=0x%x pc=%s lr=%s sp=0x%llx far=0x%llx esr=0x%x\n",
+            ctx->error_desc, pc_s, lr_s,
+            (unsigned long long)ctx->sp.x,
+            (unsigned long long)ctx->far.x,
+            ctx->esr);
+    nupLogf("  x0=%016llx x1=%016llx x2=%016llx x3=%016llx\n",
+            (unsigned long long)ctx->cpu_gprs[0].x,
+            (unsigned long long)ctx->cpu_gprs[1].x,
+            (unsigned long long)ctx->cpu_gprs[2].x,
+            (unsigned long long)ctx->cpu_gprs[3].x);
+    nupLogf("  x4=%016llx x5=%016llx x6=%016llx x7=%016llx\n",
+            (unsigned long long)ctx->cpu_gprs[4].x,
+            (unsigned long long)ctx->cpu_gprs[5].x,
+            (unsigned long long)ctx->cpu_gprs[6].x,
+            (unsigned long long)ctx->cpu_gprs[7].x);
+    nupTraceDumpRecent("LIBNX EXCEPTION", 64);
+    nupLogClose();
+}
+
+static void on_sdk_user_exception(void* info) {
+    if (!info) {
+        nupLogf("!!! SDK USER EXCEPTION: info=NULL\n");
+        nupLogFlush();
+        return;
+    }
+    const u32* w = (const u32*)info;
+    const u64* q = (const u64*)info;
+    const u32 exc_type = w[0];
+    const u64 fp = q[30];
+    const u64 lr = nupStripCodePac(q[31]);
+    const u64 sp = q[32];
+    const u64 pc = nupStripCodePac(q[33]);
+    const u32 esr = w[69];
+    const u64 far = q[36];
+    char pc_s[64], lr_s[64];
+    nupFmtAddrMod(pc, pc_s, sizeof(pc_s));
+    nupFmtAddrMod(lr, lr_s, sizeof(lr_s));
+    u64 tid = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+    nupLogf("!!! SDK USER EXCEPTION: tid=%llu type=0x%x pc=%s lr=%s sp=0x%llx fp=0x%llx far=0x%llx esr=0x%x\n",
+            (unsigned long long)tid, exc_type, pc_s, lr_s,
+            (unsigned long long)sp, (unsigned long long)fp,
+            (unsigned long long)far, esr);
+    nupLogf("  x0=%016llx x1=%016llx x2=%016llx x3=%016llx\n",
+            (unsigned long long)q[1], (unsigned long long)q[2],
+            (unsigned long long)q[3], (unsigned long long)q[4]);
+    nupLogf("  x8=%016llx x9=%016llx x19=%016llx x20=%016llx\n",
+            (unsigned long long)q[9], (unsigned long long)q[10],
+            (unsigned long long)q[20], (unsigned long long)q[21]);
+    u64 fp_addr = fp;
+    for (int i = 0; i < 16 && fp_addr && (fp_addr & 7ULL) == 0; i++) {
+        if (!is_readable_addr(fp_addr, 16)) break;
+        const u64* fpp = (const u64*)(uintptr_t)fp_addr;
+        u64 next_fp = fpp[0];
+        u64 ret_lr = nupStripCodePac(fpp[1]);
+        char bt_s[64];
+        nupFmtAddrMod(ret_lr, bt_s, sizeof(bt_s));
+        u64 soff = 0;
+        const char* sym = elfAddrToSymbol(&g_mods, ret_lr, &soff);
+        if (sym)
+            nupLogf("  ex_bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)ret_lr, bt_s, sym, (unsigned long long)soff);
+        else
+            nupLogf("  ex_bt[%d] %016llx (%s)\n", i, (unsigned long long)ret_lr, bt_s);
+        if (!next_fp || next_fp <= fp_addr || (next_fp - fp_addr) > 0x100000ULL) break;
+        fp_addr = next_fp;
+    }
+    nupTraceDumpRecent("SDK USER EXCEPTION", 64);
+    nupLogFlush();
+}
+
+static void dump_abort_info(const char* tag, const void* info) {
+    char lr_s[64];
+    nupFmtAddrMod((u64)(uintptr_t)__builtin_return_address(0), lr_s, sizeof(lr_s));
+    nupLogf("!!! %s(info=%p) lr=%s\n", tag, info, lr_s);
+    if (info) {
+        const u64* q = (const u64*)info;
+        for (int i = 0; i < 10; i++) {
+            char sym_s[64];
+            nupFmtAddrMod(q[i], sym_s, sizeof(sym_s));
+            nupLogf("  [%d] = 0x%016llx (%s)\n", i, (unsigned long long)q[i], sym_s);
+        }
+        for (int i = 0; i < 8; i++) {
+            if (is_readable_addr(q[i], 4)) {
+                const char* s = (const char*)(uintptr_t)q[i];
+                if (s[0] >= 0x20 && s[0] < 0x7f && s[1] >= 0x20 && s[1] < 0x7f) {
+                    nupLogf("  str[%d] = '%.120s'\n", i, s);
+                }
+            }
+        }
+        dump_hex_bytes("info[1]", q[1], 0x40);
+        if (q[2] != q[1]) {
+            if (is_readable_addr(q[2], 1) && *(const u8*)(uintptr_t)q[2] == 0)
+                nupLogf("  info[2] @ 0x%llx: \"\" (empty string)\n", (unsigned long long)q[2]);
+            else
+                dump_hex_bytes("info[2]", q[2], 0x20);
+        }
+    }
+    u64* fp = (u64*)__builtin_frame_address(0);
+    for (int i = 0; i < 24 && fp; i++) {
+        if (!is_readable_addr((u64)(uintptr_t)fp, 16))
+            break;
+        u64 lr = nupStripCodePac(fp[1]);
+        u64* nx = (u64*)(uintptr_t)fp[0];
+        char bt_s[64];
+        nupFmtAddrMod(lr, bt_s, sizeof(bt_s));
+        u64 sym_off = 0;
+        const char* sym = elfAddrToSymbol(&g_mods, lr, &sym_off);
+        if (sym)
+            nupLogf("  bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)lr, bt_s, sym, (unsigned long long)sym_off);
+        else
+            nupLogf("  bt[%d] %016llx (%s)\n", i, (unsigned long long)lr, bt_s);
+        if (!nx || nx <= fp || (u64)(uintptr_t)nx - (u64)(uintptr_t)fp > 0x100000ULL)
+            break;
+        fp = nx;
+    }
+}
+
+void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
+    caller = nupStripCodePac(caller);
+    u64 tid = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+    char lr_s[64];
+    nupFmtAddrMod(caller, lr_s, sizeof(lr_s));
+    u64 lr_off = 0;
+    const char* lr_sym = elfAddrToSymbol(&g_mods, caller, &lr_off);
+    nupLogf("!!! HOOKED %s tid=%llu caller=%s (%s+0x%llx) arg0=0x%llx arg1=0x%llx\n",
+            tag, (unsigned long long)tid, lr_s, lr_sym ? lr_sym : "?",
+            (unsigned long long)lr_off, (unsigned long long)arg0, (unsigned long long)arg1);
+    u64* fp = (u64*)__builtin_frame_address(0);
+    for (int i = 0; i < 20 && fp; i++) {
+        if (!is_readable_addr((u64)(uintptr_t)fp, 16))
+            break;
+        u64 lr = nupStripCodePac(fp[1]);
+        u64* nx = (u64*)(uintptr_t)fp[0];
+        char bt_s[64];
+        nupFmtAddrMod(lr, bt_s, sizeof(bt_s));
+        u64 sym_off = 0;
+        const char* sym = elfAddrToSymbol(&g_mods, lr, &sym_off);
+        if (sym)
+            nupLogf("  bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)lr, bt_s, sym, (unsigned long long)sym_off);
+        else
+            nupLogf("  bt[%d] %016llx (%s)\n", i, (unsigned long long)lr, bt_s);
+        if (!nx || nx <= fp || (u64)(uintptr_t)nx - (u64)(uintptr_t)fp > 0x100000ULL)
+            break;
+        fp = nx;
+    }
+    nupTraceDumpRecent(tag, 64);
+    nupLogFlush();
+}
+
+static void on_abort_observer(const void* info) {
+    dump_abort_info("AbortObserver", info);
+    nupTraceDumpRecent("AbortObserver", 64);
+}
+
+static void on_sdk_abort_observer(const void* info) {
+    dump_abort_info("SdkAbortObserver", info);
+    nupTraceDumpRecent("SdkAbortObserver", 64);
+}
+
+void nupDiagReset(void) {
+    g_abort_observers_registered = false;
+    g_sdk_ex_registered = false;
+    g_worker_count = 0;
+    g_sysres_hwm = 0;
+}
+
+void nupDiagRegisterExceptionHandler(bool force) {
+    if (g_sdk_ex_registered && !force)
+        return;
+    typedef void (*SetUserExFn)(void (*)(void*), void*, size_t, void*);
+    const u64 fn = elfFindSymbol(&g_mods, "_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_");
+    if (fn) {
+        ((SetUserExFn)(uintptr_t)fn)(on_sdk_user_exception, g_sdk_ex_stack, sizeof(g_sdk_ex_stack), g_sdk_ex_info);
+        if (!g_sdk_ex_registered)
+            nupLogf("[6/6] registered nn::os::SetUserExceptionHandler\n");
+        g_sdk_ex_registered = true;
+    } else if (!g_sdk_ex_registered) {
+        nupLogf("[6/6] SetUserExceptionHandler not found; scanning...\n");
+        elfLogMatchingSymbols(&g_mods, "SetUserExceptionHandler");
+    }
+}
+
+void nupDiagRegisterAbortObservers(void) {
+    if (g_abort_observers_registered)
+        return;
+    g_abort_observers_registered = true;
+    typedef void (*InitObsFn)(void*, void (*)(const void*));
+    typedef void (*RegObsFn)(void*);
+    const u64 init_app = elfFindSymbol(&g_mods, "_ZN2nn4diag29InitializeAbortObserverHolderEPNS0_19AbortObserverHolderEPFvRKNS0_9AbortInfoEE");
+    const u64 reg_app = elfFindSymbol(&g_mods, "_ZN2nn4diag21RegisterAbortObserverEPNS0_19AbortObserverHolderE");
+    const u64 init_sdk = elfFindSymbol(&g_mods, "_ZN2nn4diag32InitializeSdkAbortObserverHolderEPNS0_22SdkAbortObserverHolderEPFvRKNS0_12SdkAbortInfoEE");
+    const u64 reg_sdk = elfFindSymbol(&g_mods, "_ZN2nn4diag24RegisterSdkAbortObserverEPNS0_22SdkAbortObserverHolderE");
+    bool any_missing = false;
+    if (init_app && reg_app) {
+        ((InitObsFn)(uintptr_t)init_app)(g_abort_holder, on_abort_observer);
+        ((RegObsFn)(uintptr_t)reg_app)(g_abort_holder);
+        nupLogf("[6/6] registered nn::diag::AbortObserver\n");
+    } else {
+        any_missing = true;
+    }
+    if (init_sdk && reg_sdk) {
+        ((InitObsFn)(uintptr_t)init_sdk)(g_sdk_abort_holder, on_sdk_abort_observer);
+        ((RegObsFn)(uintptr_t)reg_sdk)(g_sdk_abort_holder);
+        nupLogf("[6/6] registered nn::diag::SdkAbortObserver\n");
+    } else {
+        any_missing = true;
+    }
+    if (any_missing) {
+        nupLogf("[6/6] AbortObserver symbol(s) missing; scanning...\n");
+        elfLogMatchingSymbols(&g_mods, "AbortObserver");
+    }
+}
+
+void nupOnBeforeInitSdkModule(void) {
+    nupDiagRegisterExceptionHandler(false);
+    nupDiagRegisterAbortObservers();
+}
+
+void nupOnBeforeNninitStartup(void) {
+    nupDiagRegisterExceptionHandler(false);
+}
+
+void nupOnBeforeNnMain(void) {
+    // Re-register in case compat2/nninitStartup/static constructors replaced the user handler.
+    nupDiagRegisterExceptionHandler(true);
+    nupDiagRegisterAbortObservers();
+}
+
+void nupRecordWorkerThread(void* thread_type, void* fn) {
+    if (!thread_type || g_worker_count >= MAX_TRACKED_WORKERS)
+        return;
+    const u32* words = (const u32*)thread_type;
+    for (u32 i = 0; i < 0x1f0 / 4; i++) {
+        u32 cand = words[i];
+        if (cand == 0 || cand == INVALID_HANDLE)
+            continue;
+        u64 tid = 0;
+        if (R_SUCCEEDED(svcGetThreadId(&tid, (Handle)cand)) && tid != 0) {
+            u32 cur = __atomic_load_n(&g_worker_count, __ATOMIC_ACQUIRE);
+            if (cur > MAX_TRACKED_WORKERS) cur = MAX_TRACKED_WORKERS;
+            for (u32 j = 0; j < cur; j++) {
+                if (g_workers[j].handle == (Handle)cand || g_workers[j].tid == tid)
+                    return;
+            }
+            u32 idx = __atomic_fetch_add(&g_worker_count, 1, __ATOMIC_ACQ_REL);
+            if (idx < MAX_TRACKED_WORKERS) {
+                g_workers[idx].thread_type = thread_type;
+                g_workers[idx].handle = (Handle)cand;
+                g_workers[idx].tid = tid;
+                g_workers[idx].fn = fn;
+                g_workers[idx].name[0] = '\0';
+            }
+            return;
+        }
+    }
+}
+
+void nupRecordWorkerThreadName(void* thread_type, const char* name) {
+    if (!thread_type || !name)
+        return;
+    u32 cnt = __atomic_load_n(&g_worker_count, __ATOMIC_ACQUIRE);
+    if (cnt > MAX_TRACKED_WORKERS) cnt = MAX_TRACKED_WORKERS;
+    for (u32 i = 0; i < cnt; i++) {
+        if (g_workers[i].thread_type == thread_type) {
+            size_t n = strlen(name);
+            if (n >= sizeof(g_workers[i].name)) n = sizeof(g_workers[i].name) - 1;
+            memcpy(g_workers[i].name, name, n);
+            g_workers[i].name[n] = '\0';
+            return;
+        }
+    }
+}
+
+static void update_sysres_hwm(u64 cur) {
+    if (cur > g_sysres_hwm)
+        g_sysres_hwm = cur;
+}
+
+static void log_heartbeat_stats(u32 sec) {
+    u64 used = 0, sys_used = 0, sys_tot = 0, ns_used = 0, ns_tot = 0;
+    Result urc = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&ns_used, InfoType_UsedNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&ns_tot, InfoType_TotalNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
+    update_sysres_hwm(sys_used);
+    if (nupTraceIsEnabled()) {
+        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx(hwm=0x%llx) files=%u workers=%u reent=%u tr_seq=%llu drop=%llu\n",
+                sec, (unsigned long long)used, urc,
+                (unsigned long long)ns_used, (unsigned long long)ns_tot,
+                (unsigned long long)sys_used, (unsigned long long)sys_tot,
+                (unsigned long long)g_sysres_hwm,
+                g_open_file_count, g_worker_count, g_bad_reent_count,
+                (unsigned long long)nupTraceTotalSeq(),
+                (unsigned long long)nupTraceDroppedCount());
+    } else {
+        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx(hwm=0x%llx) files=%u workers=%u reent=%u\n",
+                sec, (unsigned long long)used, urc,
+                (unsigned long long)ns_used, (unsigned long long)ns_tot,
+                (unsigned long long)sys_used, (unsigned long long)sys_tot,
+                (unsigned long long)g_sysres_hwm,
+                g_open_file_count, g_worker_count, g_bad_reent_count);
+    }
+}
+
+static void heartbeat_thread_fn(void* arg) {
+    (void)arg;
+    if (nupTraceIsEnabled()) {
+        // High-frequency boot drain: 25ms steps for first 1s, then 100ms steps up to 2s,
+        // so even an uncatchable hardware fault shortly after nnMain leaves a full trail on SD.
+        u32 elapsed_ms = 0;
+        for (u32 step = 1; step <= 40; step++) {
+            svcSleepThread(25000000ULL);
+            elapsed_ms += 25u;
+            nupTracePollHeartbeat(elapsed_ms, true);
+            nupLogFlush();
+            if (elapsed_ms == 1000u)
+                log_heartbeat_stats(1u);
+        }
+        for (u32 step = 1; step <= 10; step++) {
+            svcSleepThread(100000000ULL);
+            elapsed_ms += 100u;
+            nupTracePollHeartbeat(elapsed_ms, true);
+            nupLogFlush();
+            if (elapsed_ms == 2000u)
+                log_heartbeat_stats(2u);
+        }
+    }
+    const u32 start_sec = nupTraceIsEnabled() ? 3u : 1u;
+    for (u32 t = start_sec; t <= 12; t++) {
+        svcSleepThread(1000000000ULL);
+        nupTracePollHeartbeat(t * 1000u, false);
+        nupLogFlush();
+        log_heartbeat_stats(t);
+    }
+    u32 sec = 12;
+    for (;;) {
+        svcSleepThread(2000000000ULL);
+        sec += 2;
+        nupTracePollHeartbeat(sec * 1000u, false);
+        nupLogFlush();
+    }
+}
+
+void nupDiagStartHeartbeat(void) {
+    g_main_thread_handle = envGetMainThreadHandle();
+    Result hb_rc = threadCreate(&g_hb_thread, heartbeat_thread_fn, NULL,
+                                g_hb_stack, sizeof(g_hb_stack), 0x20, -2);
+    if (R_SUCCEEDED(hb_rc))
+        hb_rc = threadStart(&g_hb_thread);
+    nupLogf("[5/6] heartbeat thread start -> 0x%x\n", hb_rc);
+}
+
+// --- Compact bounds-checked MsgPack crash summary extractor for erpt:r ---
+
+static u64 read_be64(const u8* p) {
+    return ((u64)p[0] << 56) | ((u64)p[1] << 48) | ((u64)p[2] << 40) | ((u64)p[3] << 32) |
+           ((u64)p[4] << 24) | ((u64)p[5] << 16) | ((u64)p[6] << 8)  | (u64)p[7];
+}
+
+static u32 read_be32(const u8* p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+static u16 read_be16(const u8* p) {
+    return (u16)(((u16)p[0] << 8) | (u16)p[1]);
+}
+
+static bool mp_read_uint(const u8* buf, size_t len, size_t* pos, u64* out) {
+    if (*pos >= len) return false;
+    const u8 b = buf[*pos];
+    if (b <= 0x7f) { *out = b; (*pos) += 1; return true; }
+    if (b >= 0xe0) { *out = (u64)(s64)(s8)b; (*pos) += 1; return true; }
+    if (b == 0xcc && *pos + 2 <= len) { *out = buf[*pos + 1]; (*pos) += 2; return true; }
+    if (b == 0xcd && *pos + 3 <= len) { *out = read_be16(buf + *pos + 1); (*pos) += 3; return true; }
+    if (b == 0xce && *pos + 5 <= len) { *out = read_be32(buf + *pos + 1); (*pos) += 5; return true; }
+    if (b == 0xcf && *pos + 9 <= len) { *out = read_be64(buf + *pos + 1); (*pos) += 9; return true; }
+    if (b == 0xd0 && *pos + 2 <= len) { *out = (u64)(s64)(s8)buf[*pos + 1]; (*pos) += 2; return true; }
+    if (b == 0xd1 && *pos + 3 <= len) { *out = (u64)(s64)(s16)read_be16(buf + *pos + 1); (*pos) += 3; return true; }
+    if (b == 0xd2 && *pos + 5 <= len) { *out = (u64)(s64)(s32)read_be32(buf + *pos + 1); (*pos) += 5; return true; }
+    if (b == 0xd3 && *pos + 9 <= len) { *out = read_be64(buf + *pos + 1); (*pos) += 9; return true; }
+    return false;
+}
+
+static bool mp_read_str(const u8* buf, size_t len, size_t* pos, char* out, size_t out_sz) {
+    if (*pos >= len) return false;
+    const u8 b = buf[*pos];
+    size_t slen = 0, hdr = 0;
+    if ((b & 0xe0) == 0xa0) { slen = b & 0x1f; hdr = 1; }
+    else if (b == 0xd9 && *pos + 2 <= len) { slen = buf[*pos + 1]; hdr = 2; }
+    else if (b == 0xda && *pos + 3 <= len) { slen = read_be16(buf + *pos + 1); hdr = 3; }
+    else return false;
+    if (*pos + hdr + slen > len) return false;
+    size_t cp = slen < (out_sz - 1) ? slen : (out_sz - 1);
+    memcpy(out, buf + *pos + hdr, cp);
+    out[cp] = '\0';
+    *pos += hdr + slen;
+    return true;
+}
+
+static bool erpt_key_interesting(const char* k) {
+    static const char* const keys[] = {
+        "ErrorCode", "ProgramId", "ApplicationId", "ProcessName", "AbortReason",
+        "ExceptionType", "ExceptionDesc", "ResultCode", "ModuleName",
+        "CrashThreadName", "ThreadName",
+        "ProgramCounter", "LinkRegister", "StackPointer", "FramePointer",
+        "FaultAddress", "FaultingAddress", "PC", "LR", "SP", "FP", "FAR", "ESR",
+        "Backtrace", "StackTrace", "StackTraceSize",
+        NULL
+    };
+    for (int i = 0; keys[i]; i++) {
+        if (strcmp(k, keys[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void log_erpt_summary(const u8* buf, size_t len) {
+    u32 logged = 0;
+    for (size_t i = 0; i < len && logged < 24; ) {
+        size_t p = i;
+        char key[48];
+        if (!mp_read_str(buf, len, &p, key, sizeof(key))) {
+            i++;
+            continue;
+        }
+        if (!erpt_key_interesting(key) || p >= len) {
+            i++;
+            continue;
+        }
+        size_t vp = p;
+        char sval[96];
+        u64 uval = 0;
+        if (mp_read_str(buf, len, &vp, sval, sizeof(sval))) {
+            nupLogf("[erpt]   %s = '%s'\n", key, sval);
+            logged++;
+            i = vp;
+            continue;
+        }
+        vp = p;
+        if (mp_read_uint(buf, len, &vp, &uval)) {
+            nupLogf("[erpt]   %s = 0x%llx\n", key, (unsigned long long)uval);
+            logged++;
+            i = vp;
+            continue;
+        }
+        // Handle MsgPack array of u64/u32 (e.g. Backtrace / StackTrace)
+        const u8 b = buf[p];
+        u32 arr_len = 0;
+        size_t ap = p;
+        if ((b & 0xf0) == 0x90) { arr_len = b & 0x0f; ap = p + 1; }
+        else if (b == 0xdc && p + 3 <= len) { arr_len = read_be16(buf + p + 1); ap = p + 3; }
+        if (arr_len > 0 && arr_len <= 32) {
+            char line[256];
+            int lpos = snprintf(line, sizeof(line), "[erpt]   %s[%u] =", key, arr_len);
+            bool ok = true;
+            for (u32 k = 0; k < arr_len && k < 8; k++) {
+                u64 elem = 0;
+                if (!mp_read_uint(buf, len, &ap, &elem)) { ok = false; break; }
+                if (lpos > 0 && (size_t)lpos < sizeof(line) - 24)
+                    lpos += snprintf(line + lpos, sizeof(line) - (size_t)lpos, " 0x%llx", (unsigned long long)elem);
+            }
+            if (ok) {
+                nupLogf("%s\n", line);
+                logged++;
+                i = ap;
+                continue;
+            }
+        }
+        i = p;
+    }
+}
+
+void nupDiagDumpLatestErpt(Handle hen_sm, FsFileSystem* sd) {
+    Service r = {};
+    Result rc = smGetService(&r, "erpt:r");
+    if (R_FAILED(rc) && hen_sm != INVALID_HANDLE) {
+        const SmServiceName enc = smEncodeName("erpt:r");
+        Service proxy = {};
+        serviceCreate(&proxy, hen_sm);
+        proxy.own_handle = 0;
+        Handle h = INVALID_HANDLE;
+        rc = serviceDispatchIn(&proxy, 1, enc,
+            .out_handle_attrs = {SfOutHandleAttr_HipcMove},
+            .out_handles = &h);
+        if (R_SUCCEEDED(rc) && h != INVALID_HANDLE)
+            serviceCreate(&r, h);
+    }
+    if (R_FAILED(rc)) {
+        nupLogf("[erpt] erpt:r open failed: 0x%x\n", rc);
+        return;
+    }
+    Service mgr = {};
+    rc = serviceDispatch(&r, 1, .out_num_objects = 1, .out_objects = &mgr);
+    if (R_FAILED(rc)) {
+        nupLogf("[erpt] manager failed: 0x%x\n", rc);
+        serviceClose(&r);
+        return;
+    }
+    static u8 list[0x15E8];
+    const u32 type = 2;
+    memset(list, 0, sizeof(list));
+    rc = serviceDispatchIn(&mgr, 0, type,
+        .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
+        .buffers = {{list, sizeof(list)}});
+    if (R_FAILED(rc)) {
+        nupLogf("[erpt] list failed: 0x%x\n", rc);
+        serviceClose(&mgr);
+        serviceClose(&r);
+        return;
+    }
+    const u32 count = *(const u32*)list;
+    nupLogf("[erpt] %u crash report(s) available\n", count);
+    u32 chosen_k = 0;
+    for (u32 k = 0; k < count && k < 10; k++) {
+        Service rep = {};
+        if (R_FAILED(serviceDispatch(&r, 0, .out_num_objects = 1, .out_objects = &rep)))
+            break;
+        struct { u8 id[20]; } in;
+        memcpy(in.id, list + 8 + k * 0x70 + 4, 20);
+        bool skip_bg = false;
+        if (R_SUCCEEDED(serviceDispatchIn(&rep, 0, in))) {
+            static u8 head[0x800];
+            u32 got = 0;
+            if (R_SUCCEEDED(serviceDispatchOut(&rep, 1, got,
+                    .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
+                    .buffers = {{head, sizeof(head)}})) && got > 24) {
+                for (u32 at = 0; at + 24 < got; at++) {
+                    if (memcmp(head + at, "ErrorCode", 9) == 0 && (head[at + 9] & 0xE0) == 0xA0) {
+                        u32 len = head[at + 9] & 31;
+                        char code[32] = {};
+                        memcpy(code, head + at + 10, len < 31 ? len : 31);
+                        if (strncmp(code, "2155-", 5) == 0 || strncmp(code, "2110-", 5) == 0)
+                            skip_bg = true;
+                        break;
+                    }
+                }
+            }
+            serviceDispatch(&rep, 4);
+        }
+        serviceClose(&rep);
+        if (!skip_bg) {
+            chosen_k = k;
+            break;
+        }
+    }
+    if (count > 0 && sd) {
+        Service rep = {};
+        if (R_SUCCEEDED(serviceDispatch(&r, 0, .out_num_objects = 1, .out_objects = &rep))) {
+            struct { u8 id[20]; } in;
+            memcpy(in.id, list + 8 + chosen_k * 0x70 + 4, 20);
+            if (R_SUCCEEDED(serviceDispatchIn(&rep, 0, in))) {
+                static u8 buf[0x10000];
+                fsFsDeleteFile(sd, "/kaihen/last_erpt.bin");
+                fsFsCreateFile(sd, "/kaihen/last_erpt.bin", 0, 0);
+                FsFile ef = {};
+                const bool f_ok = R_SUCCEEDED(fsFsOpenFile(sd, "/kaihen/last_erpt.bin",
+                                                           FsOpenMode_Write | FsOpenMode_Append, &ef));
+                s64 pos = 0;
+                u32 first_chunk_len = 0;
+                bool code_logged = false;
+                for (u32 chunk = 0; chunk < 16; chunk++) {
+                    u32 got = 0;
+                    if (R_FAILED(serviceDispatchOut(&rep, 1, got,
+                            .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
+                            .buffers = {{buf, sizeof(buf)}})) || got == 0)
+                        break;
+                    if (chunk == 0)
+                        first_chunk_len = got;
+                    if (f_ok) {
+                        fsFileWrite(&ef, pos, buf, got, FsWriteOption_Flush);
+                        pos += got;
+                    }
+                    if (!code_logged) {
+                        for (u32 at = 0; at + 24 < got; at++) {
+                            if (memcmp(buf + at, "ErrorCode", 9) == 0 && (buf[at + 9] & 0xE0) == 0xA0) {
+                                u32 len = buf[at + 9] & 31;
+                                char code[32] = {};
+                                memcpy(code, buf + at + 10, len < 31 ? len : 31);
+                                nupLogf("[erpt] latest ErrorCode='%s' [idx=%u] (dumped %lld bytes to /kaihen/last_erpt.bin)\n",
+                                        code, chosen_k, (long long)pos);
+                                code_logged = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (f_ok) {
+                    fsFileFlush(&ef);
+                    fsFileClose(&ef);
+                    fsFsCommit(sd);
+                }
+                if (!code_logged)
+                    nupLogf("[erpt] dumped %lld bytes [idx=%u] to /kaihen/last_erpt.bin\n", (long long)pos, chosen_k);
+                if (first_chunk_len > 0)
+                    log_erpt_summary(buf, first_chunk_len);
+                serviceDispatch(&rep, 4);
+            }
+            serviceClose(&rep);
+        }
+    }
+    serviceClose(&mgr);
+    serviceClose(&r);
+}

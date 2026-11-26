@@ -170,14 +170,11 @@ static void (*real_StdAllocInit3)(void*, void*, size_t, bool) = NULL;
 static void (*real_StdAllocCtor2)(void*, void*, size_t) = NULL;
 static u32 (*real_RoLookupSymbol)(uintptr_t*, const char*) = NULL;
 static u32 (*real_RoLookupModuleSymbol)(uintptr_t*, const void*, const char*) = NULL;
+static int (*real_GetHostArgc)(void) = NULL;
+static char** (*real_GetHostArgv)(void) = NULL;
 
 extern ModuleSet g_mods;
-extern void nupOnBeforeInitSdkModule(void);
-extern void nupOnBeforeNninitStartup(void);
-extern void nupOnBeforeNnMain(void);
-extern void nupRecordWorkerThread(void* thread_type, void* fn);
-extern void nupRecordWorkerThreadName(void* thread_type, const char* name);
-extern void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1);
+#include "diag.h"
 
 volatile u32 g_open_file_count = 0;
 volatile u32 g_post_aov_active = 0;
@@ -2575,6 +2572,37 @@ static void hook_SetThreadNamePtr(void* thread, const char* name) {
     if (real_SetThreadNamePtr) real_SetThreadNamePtr(thread, name);
 }
 
+static int hook_GetHostArgc(void) {
+    const int argc = real_GetHostArgc ? real_GetHostArgc() : 0;
+    nupLogf("hook nn::os::GetHostArgc() -> %d\n", argc);
+    return argc;
+}
+
+static char g_safe_argv0[] = "";
+static char* g_safe_argv[] = { g_safe_argv0, NULL };
+
+static char** hook_GetHostArgv(void) {
+    char** argv = real_GetHostArgv ? real_GetHostArgv() : NULL;
+    char* p0 = NULL;
+    const char* a0 = NULL;
+    if (argv) {
+        MemoryInfo mi = {};
+        u32 pi = 0;
+        if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)argv)) && (mi.perm & Perm_R)) {
+            p0 = argv[0];
+            if (p0 && R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)p0)) && (mi.perm & Perm_R))
+                a0 = p0;
+        }
+    }
+    nupLogf("hook nn::os::GetHostArgv() -> %p (argv[0]=%p '%s')\n",
+            (void*)argv, (void*)p0, a0 ? a0 : "<null/unreadable>");
+    if (!argv || !a0) {
+        nupLogf("  -> substituting safe empty host argv={\"\", NULL}\n");
+        return g_safe_argv;
+    }
+    return argv;
+}
+
 static void hook_nnMain(void) {
     log_used_mem("before nnMain");
     nupOnBeforeNnMain();
@@ -2777,6 +2805,8 @@ static const HookProviderEntry g_hook_registry[] = {
     PROV_WRAP("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", hook_SetFocusHandlingMode, real_SetFocusHandlingMode, HOOK_PROV_SVC, false),
     PROV_WRAP("nninitStartup", hook_nninitStartup, real_nninitStartup, HOOK_PROV_SVC, false),
     PROV_WRAP("nnMain", hook_nnMain, real_nnMain, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os11GetHostArgcEv", hook_GetHostArgc, real_GetHostArgc, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os11GetHostArgvEv", hook_GetHostArgv, real_GetHostArgv, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEv", hook_AbortImpl0, real_AbortImpl0, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", hook_AbortImplRes, real_AbortImplRes, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZSt9terminatev", hook_StdTerminate, real_StdTerminate, HOOK_PROV_SVC, false),

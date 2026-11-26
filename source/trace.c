@@ -246,7 +246,7 @@ u64 nupTraceRecord(u32 slot_idx, u64 lr, u64 x0, u64 x1, u64 x2, u64 x3) {
         return 0;
     TraceSlot* s = &g_slots[slot_idx];
     const u64 target = s->target;
-    const u64 clean_lr = lr & 0x0000ffffffffffffULL;
+    const u64 clean_lr = lr & 0x0000007fffffffffULL;
 
     const u32 prev_hits = __atomic_fetch_add(&s->hits, 1u, __ATOMIC_RELAXED);
     if (prev_hits == 0) {
