@@ -17,7 +17,7 @@
 #include "trace.h"
 #include "ui.h"
 
-#define NUP_BUILD_TAG "0325-cap19"
+#define NUP_BUILD_TAG "0325-cap41"
 
 // Keep libnx's own heap compact (256 MiB: enough for NUP TOC + NSO staging)
 // so ~5.8 GiB remains free for the launched game's heap and GPU/virtual memory.
@@ -258,8 +258,10 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
             nupLogf("[!] nupOpenRaw failed: 0x%x\n", rc);
             return rc;
         }
-        nupLogf("[2/6] RAW opened: %s exefs=%u romfs=%d\n",
-                entry->path, exefs_count, g_nup.has_romfs ? 1 : 0);
+        nupLogf("[2/6] RAW opened: %s exefs=%u romfs=%d (%s) app_root=%s\n",
+                entry->path, exefs_count, g_nup.has_romfs ? 1 : 0,
+                g_nup.raw_romfs_root[0] ? g_nup.raw_romfs_root : "none",
+                g_nup.raw_app_root);
     } else {
         if (!nupProbe(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
             nupLogf("[!] nupProbe failed\n");

@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <switch.h>
 
-#define MAX_NUP_ENTRIES 32
+#define MAX_NUP_ENTRIES 64
 
 typedef struct {
     char label[0x60];

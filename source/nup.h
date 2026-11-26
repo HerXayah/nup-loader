@@ -273,9 +273,11 @@ static inline Result nupRawDirGetEntryCount(FsDir* d, s64* out_cnt) {
 
 typedef struct {
     bool is_raw;
+    bool raw_is_subprogram;
     FsFileSystem* raw_sd;
     char raw_app_root[0x300];
     char raw_root[0x300];
+    char raw_romfs_root[0x300];
 
     FsFile file;
     bool open;

@@ -24,6 +24,34 @@ static bool already_listed(const NupEntry* entries, int count, const char* path)
     return false;
 }
 
+static bool sd_is_dir(FsFileSystem* sd, const char* path) {
+    u32 et = 0;
+    return R_SUCCEEDED(nupRawFsGetEntryType(sd, path, &et)) && et == FsDirEntryType_Dir;
+}
+
+static void try_add_raw_entry(FsFileSystem* sd, const char* full_path,
+                              const char* base_name, int prog_idx,
+                              NupEntry* entries, int* count) {
+    if (*count >= MAX_NUP_ENTRIES || already_listed(entries, *count, full_path))
+        return;
+    u64 tid = 0;
+    u32 exefs_cnt = 0;
+    if (!nupProbeRaw(sd, full_path, &tid, NULL, &exefs_cnt))
+        return;
+    NupEntry* e = &entries[(*count)++];
+    memset(e, 0, sizeof(*e));
+    if (prog_idx > 0) {
+        const char* tag = ((tid >> 56) == 0x04) ? "Sw2 P" : "P";
+        snprintf(e->label, sizeof(e->label), "%.42s [%s%d]", base_name, tag, prog_idx);
+    } else {
+        snprintf(e->label, sizeof(e->label), "%.54s", base_name);
+    }
+    snprintf(e->path, sizeof(e->path), "%s", full_path);
+    e->title_id = tid;
+    e->exefs_count = exefs_cnt;
+    e->is_raw = true;
+}
+
 static void scan_dir(FsFileSystem* sd, const char* dir_path,
                      NupEntry* entries, int* count,
                      char* skip_note, size_t skip_note_sz) {
@@ -39,13 +67,12 @@ static void scan_dir(FsFileSystem* sd, const char* dir_path,
             snprintf(full, sizeof(full), "/%s", item->d_name);
         else
             snprintf(full, sizeof(full), "%s/%s", dir_path, item->d_name);
-        if (already_listed(entries, *count, full))
-            continue;
 
-        u64 tid = 0;
-        u32 exefs_cnt = 0;
-        bool is_raw = false;
         if (has_nup_ext(item->d_name)) {
+            if (already_listed(entries, *count, full))
+                continue;
+            u64 tid = 0;
+            u32 exefs_cnt = 0;
             if (!nupProbe(sd, full, &tid, NULL, &exefs_cnt)) {
                 if (skip_note && skip_note_sz) {
                     snprintf(skip_note, skip_note_sz, "Skipped %.40s: %s",
@@ -53,18 +80,28 @@ static void scan_dir(FsFileSystem* sd, const char* dir_path,
                 }
                 continue;
             }
+            NupEntry* e = &entries[(*count)++];
+            memset(e, 0, sizeof(*e));
+            snprintf(e->label, sizeof(e->label), "%.54s", item->d_name);
+            snprintf(e->path, sizeof(e->path), "%s", full);
+            e->title_id = tid;
+            e->exefs_count = exefs_cnt;
+            e->is_raw = false;
         } else {
-            if (!nupProbeRaw(sd, full, &tid, NULL, &exefs_cnt))
-                continue;
-            is_raw = true;
+            try_add_raw_entry(sd, full, item->d_name, 0, entries, count);
+            // Multi-program dumps (e.g. Switch 2 Edition game/program1/exefs+romfs)
+            char prog_parent[0x410];
+            snprintf(prog_parent, sizeof(prog_parent), "%s/game", full);
+            if (!sd_is_dir(sd, prog_parent))
+                snprintf(prog_parent, sizeof(prog_parent), "%s", full);
+            for (int p = 1; p <= 7 && *count < MAX_NUP_ENTRIES; p++) {
+                char prog_dir[0x420];
+                snprintf(prog_dir, sizeof(prog_dir), "%s/program%d", prog_parent, p);
+                if (!sd_is_dir(sd, prog_dir))
+                    break;
+                try_add_raw_entry(sd, prog_dir, item->d_name, p, entries, count);
+            }
         }
-        NupEntry* e = &entries[(*count)++];
-        memset(e, 0, sizeof(*e));
-        snprintf(e->label, sizeof(e->label), "%.54s", item->d_name);
-        snprintf(e->path, sizeof(e->path), "%s", full);
-        e->title_id = tid;
-        e->exefs_count = exefs_cnt;
-        e->is_raw = is_raw;
     }
     closedir(dir);
 }

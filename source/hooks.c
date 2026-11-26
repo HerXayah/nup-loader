@@ -587,9 +587,13 @@ void hooksInit(NupArchive* nup, FsFileSystem* sd,
     if (g_nup && g_nup->is_raw && g_nup->raw_root[0]) {
         const char* app_root = g_nup->raw_app_root[0] ? g_nup->raw_app_root : g_nup->raw_root;
         char ov[0x300];
-        format_sd_subpath(app_root, "romfs_update", ov, sizeof(ov));
-        if (!sd_dir_exists(ov))
+        if (g_nup->raw_is_subprogram) {
             format_sd_subpath(g_nup->raw_root, "romfs_update", ov, sizeof(ov));
+        } else {
+            format_sd_subpath(app_root, "romfs_update", ov, sizeof(ov));
+            if (!sd_dir_exists(ov))
+                format_sd_subpath(g_nup->raw_root, "romfs_update", ov, sizeof(ov));
+        }
         if (sd_dir_exists(ov)) {
             g_has_rom_overlay = true;
             strncpy(g_rom_overlay_root, ov, sizeof(g_rom_overlay_root) - 1);
@@ -757,7 +761,10 @@ static u32 register_rom_mount(const char* name) {
     u32 rc;
     if (g_nup && g_nup->is_raw) {
         char rom_root[0x300];
-        format_sd_subpath(g_nup->raw_root, "romfs", rom_root, sizeof(rom_root));
+        if (g_nup->raw_romfs_root[0])
+            snprintf(rom_root, sizeof(rom_root), "%s", g_nup->raw_romfs_root);
+        else
+            format_sd_subpath(g_nup->raw_root, "romfs", rom_root, sizeof(rom_root));
         rc = register_vfs_mount(name, MOUNT_SD_RO, rom_root,
                                 g_has_rom_overlay ? g_rom_overlay_root : NULL);
     } else {
@@ -780,13 +787,48 @@ static u32 register_sd_save_mount(const char* tag, const char* name, u64 app_id,
 
 // --- Mount / Unmount / Query hooks ---
 
+static u32 register_rom_mount_idx(const char* name, int prog_idx) {
+    if (g_nup && g_nup->is_raw && prog_idx >= 0) {
+        const char* app_root = g_nup->raw_app_root[0] ? g_nup->raw_app_root : g_nup->raw_root;
+        char game_dir[0x300];
+        format_sd_subpath(app_root, "game", game_dir, sizeof(game_dir));
+        const char* base = sd_dir_exists(game_dir) ? game_dir : app_root;
+        char rom_root[0x300];
+        if (prog_idx == 0) {
+            format_sd_subpath(base, "romfs", rom_root, sizeof(rom_root));
+        } else {
+            char sub[32];
+            snprintf(sub, sizeof(sub), "program%d/romfs", prog_idx);
+            format_sd_subpath(base, sub, rom_root, sizeof(rom_root));
+        }
+        if (sd_dir_exists(rom_root)) {
+            const bool same_as_active = (g_nup->raw_romfs_root[0] &&
+                                         strcmp(rom_root, g_nup->raw_romfs_root) == 0);
+            const u32 rc = register_vfs_mount(name, MOUNT_SD_RO, rom_root,
+                                              (same_as_active && g_has_rom_overlay) ? g_rom_overlay_root : NULL);
+            nupLogf("hook MountRomIdx('%s', prog=%d) -> SD '%s' (rc=0x%x)\n",
+                    name ? name : "(null)", prog_idx, rom_root, rc);
+            return rc;
+        }
+    } else if (g_nup && !g_nup->is_raw && prog_idx >= 0 && (u32)prog_idx < g_nup->part_count) {
+        const u32 ridx = g_nup->parts[prog_idx].romfs_dir_idx;
+        if (ridx < g_nup->dir_count) {
+            const u32 rc = register_vfs_mount_nup(name, ridx);
+            nupLogf("hook MountRomIdx('%s', prog=%d) -> NUP dir=%u (rc=0x%x)\n",
+                    name ? name : "(null)", prog_idx, ridx, rc);
+            return rc;
+        }
+    }
+    return register_rom_mount(name);
+}
+
 static u32 hook_QueryMountRomCacheSize1(size_t* out) { if (out) *out = 0x1000; return 0; }
 static u32 hook_QueryMountRomCacheSizeAppId(size_t* out, u64 a) { (void)a; if (out) *out = 0x1000; return 0; }
 static u32 hook_QueryMountRomCacheSizeIdx(size_t* out, int i) { (void)i; if (out) *out = 0x1000; return 0; }
 static u32 hook_MountRom1(const char* name) { return register_rom_mount(name); }
 static u32 hook_MountRom3(const char* name, void* b, size_t s) { (void)b; (void)s; return register_rom_mount(name); }
 static u32 hook_MountRomAppId(const char* name, u64 a, void* b, size_t s) { (void)a; (void)b; (void)s; return register_rom_mount(name); }
-static u32 hook_MountRomIdx(const char* name, int i, void* b, size_t s) { (void)i; (void)b; (void)s; return register_rom_mount(name); }
+static u32 hook_MountRomIdx(const char* name, int i, void* b, size_t s) { (void)b; (void)s; return register_rom_mount_idx(name, i); }
 static bool hook_CanMountRom(u64 app_id) { (void)app_id; return true; }
 
 static u32 hook_Unmount(const char* name) {
@@ -2393,7 +2435,42 @@ static void wrap_nvnDeviceBuilderSetFlags(void* builder, int flags) {
     if (real_nvnDeviceBuilderSetFlags) real_nvnDeviceBuilderSetFlags(builder, flags);
 }
 
+static volatile u32 g_nvn_shader_ver_warned = 0;
+
+static bool hooks_is_readable(u64 addr, u64 sz) {
+    if (!addr || addr < 0x10000ULL) return false;
+    MemoryInfo mi = {};
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) return false;
+    return (mi.perm & Perm_R) && (addr + sz <= mi.addr + mi.size);
+}
+
+static void check_compat2_shader_version(int count, const void* stageData) {
+    if (!g_caps.has_compat2 || !stageData || count <= 0)
+        return;
+    if (__atomic_load_n(&g_nvn_shader_ver_warned, __ATOMIC_RELAXED))
+        return;
+    // NVNshaderData and NVNshaderDataExt both store { u64 gpu_addr, const void* control } at +0/+8.
+    if (!hooks_is_readable((u64)(uintptr_t)stageData, 16))
+        return;
+    const u64 ctrl = *(const u64*)((const u8*)stageData + 8);
+    if (!ctrl || !hooks_is_readable(ctrl, 12))
+        return;
+    const u32 magic = *(const u32*)(uintptr_t)(ctrl + 0);
+    const u32 ver   = *(const u32*)(uintptr_t)(ctrl + 4);
+    const u32 sub   = *(const u32*)(uintptr_t)(ctrl + 8);
+    if (magic == 0x98761234u && ver != 1u) {
+        if (__atomic_exchange_n(&g_nvn_shader_ver_warned, 1u, __ATOMIC_RELAXED) == 0u) {
+            nupLogf("!!! [nvn] COMPAT2 SHADER VERSION MISMATCH: magic=0x%08x ver=%u subver=%u "
+                    "(compat2 requires ver=1 Maxwell; ver=201 is Switch 2 Ampere - check RomFS / launch program1)\n",
+                    magic, ver, sub);
+            nupLogFlush();
+        }
+    }
+}
+
 static u8 wrap_nvnProgramSetShaders(void* prog, int count, const void* stageData) {
+    check_compat2_shader_version(count, stageData);
     const u8 ok = real_nvnProgramSetShaders ? real_nvnProgramSetShaders(prog, count, stageData) : 0;
     if (ok) {
         __atomic_add_fetch(&g_nvn_shader_ok, 1u, __ATOMIC_RELAXED);
@@ -2407,6 +2484,7 @@ static u8 wrap_nvnProgramSetShaders(void* prog, int count, const void* stageData
 }
 
 static u8 wrap_nvnProgramSetShadersExt(void* prog, int count, const void* stageData) {
+    check_compat2_shader_version(count, stageData);
     const u8 ok = real_nvnProgramSetShadersExt ? real_nvnProgramSetShadersExt(prog, count, stageData) : 0;
     if (ok) {
         __atomic_add_fetch(&g_nvn_shader_ok, 1u, __ATOMIC_RELAXED);
@@ -2419,89 +2497,23 @@ static u8 wrap_nvnProgramSetShadersExt(void* prog, int count, const void* stageD
     return ok;
 }
 
-static bool hooks_is_readable(u64 addr, u64 sz) {
-    if (!addr || addr < 0x10000ULL) return false;
-    MemoryInfo mi = {};
-    u32 pi = 0;
-    if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) return false;
-    return (mi.perm & Perm_R) && (addr + sz <= mi.addr + mi.size);
-}
-
 static void wrap_nvnQueueSubmitCommands(void* q, int numCommands, const u64* handles) {
     const u32 s = __atomic_add_fetch(&g_nvn_submit_calls, 1u, __ATOMIC_RELAXED);
-    if (s <= 16 && !g_nvn_err_logged && handles && numCommands > 0 &&
-        real_nvnQueueSubmitCommands && real_nvnQueueFinish && real_nvnQueueGetError) {
-        nupLogf("[nvn] submit #%u ENTER (q=%p, n=%d, shaders=%u/%u pools=%u)\n",
-                s, q, numCommands, g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
-        nupLogFlush();
-        for (int i = 0; i < numCommands; i++) {
-            real_nvnQueueSubmitCommands(q, 1, &handles[i]);
-            real_nvnQueueFinish(q);
-            u64 info[8] = {};
-            const int err = real_nvnQueueGetError(q, info);
-            if (err != 0) {
-                g_nvn_err_logged = 1;
-                const u64 h = handles[i];
-                const u64 ctrl = h & 0x0000FFFFFFFFFFF8ULL;
-                nupLogf("!!! [nvn] FAULT at submit #%u cmd[%d/%d] handle=0x%llx ctrl=0x%llx -> err=%d (shaders=%u/%u pools=%u)\n",
-                        s, i, numCommands, (unsigned long long)h, (unsigned long long)ctrl, err,
-                        g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
-                // Also log handles of cmd[0..i] for comparison
-                for (int p = 0; p < i && p < 8; p++) {
-                    const u64 pc = handles[p] & 0x0000FFFFFFFFFFF8ULL;
-                    if (hooks_is_readable(pc, 0x20)) {
-                        const u64* pq = (const u64*)(uintptr_t)pc;
-                        nupLogf("    ok cmd[%d] h=0x%llx: %016llx %016llx %016llx %016llx\n",
-                                p, (unsigned long long)handles[p],
-                                (unsigned long long)pq[0], (unsigned long long)pq[1],
-                                (unsigned long long)pq[2], (unsigned long long)pq[3]);
-                    }
-                }
-                if (hooks_is_readable(ctrl, 0x80)) {
-                    const u64* cq = (const u64*)(uintptr_t)ctrl;
-                    for (u32 k = 0; k < 16; k += 4) {
-                        nupLogf("    ctrl+%02x: %016llx %016llx %016llx %016llx\n",
-                                k * 8,
-                                (unsigned long long)cq[k], (unsigned long long)cq[k + 1],
-                                (unsigned long long)cq[k + 2], (unsigned long long)cq[k + 3]);
-                    }
-                    // Walk NVN GPFIFO segment entries: { u64 gpu, u64 cpu, u32 nwords, u32 flags } (24 bytes each)
-                    u32 nsegs = (u32)(h >> 48);
-                    if (nsegs == 0 || nsegs > 8) nsegs = 4;
-                    for (u32 sg = 0; sg < nsegs; sg++) {
-                        const u64 ent = ctrl + (u64)sg * 24ULL;
-                        if (!hooks_is_readable(ent, 24)) break;
-                        const u64 gpu = *(const u64*)(uintptr_t)(ent + 0);
-                        const u64 cpu = *(const u64*)(uintptr_t)(ent + 8);
-                        const u32 nw  = *(const u32*)(uintptr_t)(ent + 16);
-                        const u32 flg = *(const u32*)(uintptr_t)(ent + 20);
-                        nupLogf("    [seg #%u gpu=0x%llx cpu=0x%llx nwords=%u flags=0x%x]:\n",
-                                sg, (unsigned long long)gpu, (unsigned long long)cpu, nw, flg);
-                        u32 dump_w = nw;
-                        if (dump_w > 96) dump_w = 96;
-                        if (cpu && (cpu & 3ULL) == 0 && dump_w > 0 && hooks_is_readable(cpu, (u64)dump_w * 4ULL)) {
-                            const u32* cw = (const u32*)(uintptr_t)cpu;
-                            for (u32 j = 0; j < dump_w; j += 4) {
-                                u32 w0 = cw[j];
-                                u32 w1 = (j + 1 < dump_w) ? cw[j + 1] : 0;
-                                u32 w2 = (j + 2 < dump_w) ? cw[j + 2] : 0;
-                                u32 w3 = (j + 3 < dump_w) ? cw[j + 3] : 0;
-                                nupLogf("      +%02x: %08x %08x %08x %08x\n", j * 4, w0, w1, w2, w3);
-                            }
-                        }
-                    }
-                }
-                nupLogFlush();
-                // Submit remaining handles if any without finishing one-by-one
-                if (i + 1 < numCommands)
-                    real_nvnQueueSubmitCommands(q, numCommands - (i + 1), &handles[i + 1]);
-                return;
-            }
-        }
-        nupLogf("[nvn] submit #%u ALL %d cmd(s) OK!\n", s, numCommands);
-        return;
-    }
     if (real_nvnQueueSubmitCommands) real_nvnQueueSubmitCommands(q, numCommands, handles);
+    if (s <= 4) {
+        nupLogf("[nvn] submit #%u (q=%p, n=%d, shaders=%u/%u pools=%u)\n",
+                s, q, numCommands, g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
+    }
+    if (s == 1 && !g_nvn_err_logged && real_nvnQueueGetError) {
+        u64 info[8] = {};
+        const int err = real_nvnQueueGetError(q, info);
+        if (err != 0) {
+            g_nvn_err_logged = 1;
+            nupLogf("!!! [nvn] nvnQueueGetError after submit #1 -> err=%d (shaders=%u/%u pools=%u)\n",
+                    err, g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
+            nupLogFlush();
+        }
+    }
 }
 
 static void wrap_nvnQueuePresentTexture(void* q, void* w, int idx) {
@@ -2587,6 +2599,7 @@ static void* hook_NvnBootstrapLoader(const char* name) {
         g_nvn_shader_fail = 0;
         g_nvn_dev_flags = -1;
         g_nvn_err_logged = 0;
+        g_nvn_shader_ver_warned = 0;
         nupLogf("  [trace] proxying nvnDeviceGetProcAddress for runtime NVN tracing\n");
         return (void*)hook_NvnDeviceGetProcAddress;
     }

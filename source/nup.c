@@ -647,6 +647,27 @@ bool nupProbeRaw(FsFileSystem* sd, const char* dir_path, u64* out_title_id,
     return true;
 }
 
+static bool strip_program_subdir_tail(const char* path, char* out_parent, size_t out_sz) {
+    const size_t len = strlen(path);
+    // Match trailing "/program<1..9>"
+    if (len < 10)
+        return false;
+    const char last = path[len - 1];
+    if (last < '1' || last > '9')
+        return false;
+    if (strncmp(path + len - 9, "/program", 8) != 0)
+        return false;
+    const size_t pfx = len - 9;
+    if (pfx == 0) {
+        snprintf(out_parent, out_sz, "/");
+    } else {
+        const size_t n = pfx < out_sz - 1 ? pfx : out_sz - 1;
+        memcpy(out_parent, path, n);
+        out_parent[n] = '\0';
+    }
+    return true;
+}
+
 Result nupOpenRaw(NupArchive* nup, FsFileSystem* sd, const char* dir_path) {
     memset(nup, 0, sizeof(*nup));
     nupSpinInit(&nup->io_lock);
@@ -657,10 +678,35 @@ Result nupOpenRaw(NupArchive* nup, FsFileSystem* sd, const char* dir_path) {
     if (!resolve_raw_game_dir(sd, dir_path, nup->raw_root, sizeof(nup->raw_root)))
         snprintf(nup->raw_root, sizeof(nup->raw_root), "%s", dir_path);
 
-    char romfs_dir[FS_MAX_PATH];
-    snprintf(romfs_dir, sizeof(romfs_dir), "%s/romfs", nup->raw_root);
+    char sub_parent[0x300] = {};
+    if (strip_program_subdir_tail(nup->raw_root, sub_parent, sizeof(sub_parent))) {
+        nup->raw_is_subprogram = true;
+        // Derive app root above optional "/game" parent so shared "<App>/dlc" is discovered.
+        const size_t plen = strlen(sub_parent);
+        if (plen > 5 && strcmp(sub_parent + plen - 5, "/game") == 0) {
+            const size_t alen = plen - 5;
+            const size_t n = alen < sizeof(nup->raw_app_root) - 1 ? alen : sizeof(nup->raw_app_root) - 1;
+            memcpy(nup->raw_app_root, sub_parent, n);
+            nup->raw_app_root[n] = '\0';
+        } else {
+            snprintf(nup->raw_app_root, sizeof(nup->raw_app_root), "%s", sub_parent);
+        }
+    }
+
+    char romfs_dir[0x300];
+    snprintf(romfs_dir, sizeof(romfs_dir), "%.755s/romfs", nup->raw_root);
     u32 etype = 0;
-    nup->has_romfs = R_SUCCEEDED(nupRawFsGetEntryType(sd, romfs_dir, &etype)) && etype == 0;
+    if (R_SUCCEEDED(nupRawFsGetEntryType(sd, romfs_dir, &etype)) && etype == FsDirEntryType_Dir) {
+        nup->has_romfs = true;
+        memcpy(nup->raw_romfs_root, romfs_dir, sizeof(nup->raw_romfs_root));
+    } else if (nup->raw_is_subprogram && sub_parent[0]) {
+        // Fallback to parent game/romfs when a multi-program dump shares a single romfs.
+        snprintf(romfs_dir, sizeof(romfs_dir), "%.755s/romfs", sub_parent);
+        if (R_SUCCEEDED(nupRawFsGetEntryType(sd, romfs_dir, &etype)) && etype == FsDirEntryType_Dir) {
+            nup->has_romfs = true;
+            memcpy(nup->raw_romfs_root, romfs_dir, sizeof(nup->raw_romfs_root));
+        }
+    }
     return 0;
 }
 
@@ -707,10 +753,16 @@ void nupFormatRawRomPath(const NupArchive* nup, const char* rel_path, char* out,
     const char* p = rel_path ? rel_path : "";
     while (*p == '/')
         p++;
-    if (*p)
+    if (nup->raw_romfs_root[0]) {
+        if (*p)
+            snprintf(out, out_sz, "%s/%s", nup->raw_romfs_root, p);
+        else
+            snprintf(out, out_sz, "%s", nup->raw_romfs_root);
+    } else if (*p) {
         snprintf(out, out_sz, "%s/romfs/%s", nup->raw_root, p);
-    else
+    } else {
         snprintf(out, out_sz, "%s/romfs", nup->raw_root);
+    }
     // Strip trailing slashes (Switch FS rejects trailing '/' on non-root paths).
     size_t len = strlen(out);
     while (len > 1 && out[len - 1] == '/')
