@@ -17,7 +17,7 @@
 #include "trace.h"
 #include "ui.h"
 
-#define NUP_BUILD_TAG "0325-cap15"
+#define NUP_BUILD_TAG "0325-cap16"
 
 // Keep libnx's own heap compact (256 MiB: enough for NUP TOC + NSO staging)
 // so ~5.8 GiB remains free for the launched game's heap and GPU/virtual memory.

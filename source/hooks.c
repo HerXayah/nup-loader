@@ -2315,15 +2315,24 @@ static u32 hook_ViCreateLayer(void** out, void* disp) {
 
 static void* (*real_NvnDeviceGetProcAddress)(void*, const char*) = NULL;
 static u8 (*real_nvnDeviceInitialize)(void*, const void*) = NULL;
+static void (*real_nvnDeviceBuilderSetFlags)(void*, int) = NULL;
 static u8 (*real_nvnQueueInitialize)(void*, const void*) = NULL;
 static u8 (*real_nvnWindowInitialize)(void*, const void*) = NULL;
 static u8 (*real_nvnMemoryPoolInitialize)(void*, const void*) = NULL;
 static void (*real_nvnQueuePresentTexture)(void*, void*, int) = NULL;
+static void (*real_nvnQueueSubmitCommands)(void*, int, const u64*) = NULL;
+static void (*real_nvnQueueFinish)(void*) = NULL;
 static int (*real_nvnQueueGetError)(void*, void*) = NULL;
+static u8 (*real_nvnProgramSetShaders)(void*, int, const void*) = NULL;
 static void* g_last_nvn_queue = NULL;
 static u32 g_nvn_gpa_logs = 0;
 static u32 g_nvn_mempool_calls = 0;
 static u32 g_nvn_present_frames = 0;
+static u32 g_nvn_submit_calls = 0;
+static u32 g_nvn_shader_ok = 0;
+static u32 g_nvn_shader_fail = 0;
+static int g_nvn_dev_flags = -1;
+static volatile u32 g_nvn_err_logged = 0;
 
 static void log_gpu_remote_inline(u64* out_used, u64* out_tot) {
     u64 u = 0, t = 0;
@@ -2377,13 +2386,55 @@ static u8 wrap_nvnMemoryPoolInitialize(void* pool, const void* builder) {
     return ok;
 }
 
+static void wrap_nvnDeviceBuilderSetFlags(void* builder, int flags) {
+    g_nvn_dev_flags = flags;
+    nupLogf("[nvn] nvnDeviceBuilderSetFlags(builder=%p, flags=0x%x)\n", builder, flags);
+    if (real_nvnDeviceBuilderSetFlags) real_nvnDeviceBuilderSetFlags(builder, flags);
+}
+
+static u8 wrap_nvnProgramSetShaders(void* prog, int count, const void* stageData) {
+    const u8 ok = real_nvnProgramSetShaders ? real_nvnProgramSetShaders(prog, count, stageData) : 0;
+    if (ok) {
+        __atomic_add_fetch(&g_nvn_shader_ok, 1u, __ATOMIC_RELAXED);
+    } else {
+        const u32 f = __atomic_add_fetch(&g_nvn_shader_fail, 1u, __ATOMIC_RELAXED);
+        if (f <= 16)
+            nupLogf("[nvn] nvnProgramSetShaders #%u(prog=%p, count=%d, data=%p) -> FAILED\n",
+                    f, prog, count, stageData);
+    }
+    return ok;
+}
+
+static void wrap_nvnQueueSubmitCommands(void* q, int numCommands, const u64* handles) {
+    const u32 s = __atomic_add_fetch(&g_nvn_submit_calls, 1u, __ATOMIC_RELAXED);
+    if (real_nvnQueueSubmitCommands) real_nvnQueueSubmitCommands(q, numCommands, handles);
+    if (s <= 48 && !g_nvn_err_logged && real_nvnQueueFinish && real_nvnQueueGetError) {
+        real_nvnQueueFinish(q);
+        u64 info[8] = {};
+        const int err = real_nvnQueueGetError(q, info);
+        if (err != 0 || s <= 12) {
+            nupLogf("[nvn] submit #%u(q=%p, n=%d, h0=0x%llx) finish -> err=%d (shaders=%u/%u pools=%u dev_flags=0x%x)\n",
+                    s, q, numCommands, (unsigned long long)(numCommands > 0 && handles ? handles[0] : 0ULL),
+                    err, g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls, g_nvn_dev_flags);
+            if (err != 0) {
+                g_nvn_err_logged = 1;
+                nupLogf("      err_info: %016llx %016llx %016llx %016llx\n",
+                        (unsigned long long)info[0], (unsigned long long)info[1],
+                        (unsigned long long)info[2], (unsigned long long)info[3]);
+                nupLogFlush();
+            }
+        }
+    }
+}
+
 static void wrap_nvnQueuePresentTexture(void* q, void* w, int idx) {
     const u32 f = __atomic_add_fetch(&g_nvn_present_frames, 1u, __ATOMIC_RELAXED);
     if (f <= 3 || f == 10 || f == 60 || (f % 300u) == 0u) {
         u64 gu = 0, gt = 0;
         log_gpu_remote_inline(&gu, &gt);
-        nupLogf("[nvn] nvnQueuePresentTexture frame #%u (q=%p w=%p idx=%d gpu=%llu/%llu MiB)\n",
-                f, q, w, idx, (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+        nupLogf("[nvn] nvnQueuePresentTexture frame #%u (q=%p w=%p idx=%d submits=%u shaders=%u/%u gpu=%llu/%llu MiB)\n",
+                f, q, w, idx, g_nvn_submit_calls, g_nvn_shader_ok, g_nvn_shader_fail,
+                (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
     }
     if (real_nvnQueuePresentTexture) real_nvnQueuePresentTexture(q, w, idx);
 }
@@ -2399,6 +2450,10 @@ static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
             if (strcmp(name, "nvnDeviceInitialize") == 0) {
                 real_nvnDeviceInitialize = (u8 (*)(void*, const void*))fn;
                 return (void*)wrap_nvnDeviceInitialize;
+            }
+            if (strcmp(name, "nvnDeviceBuilderSetFlags") == 0) {
+                real_nvnDeviceBuilderSetFlags = (void (*)(void*, int))fn;
+                return (void*)wrap_nvnDeviceBuilderSetFlags;
             }
             if (strcmp(name, "nvnQueueInitialize") == 0) {
                 real_nvnQueueInitialize = (u8 (*)(void*, const void*))fn;
@@ -2416,8 +2471,19 @@ static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
                 real_nvnQueuePresentTexture = (void (*)(void*, void*, int))fn;
                 return (void*)wrap_nvnQueuePresentTexture;
             }
+            if (strcmp(name, "nvnQueueSubmitCommands") == 0) {
+                real_nvnQueueSubmitCommands = (void (*)(void*, int, const u64*))fn;
+                return (void*)wrap_nvnQueueSubmitCommands;
+            }
+            if (strcmp(name, "nvnQueueFinish") == 0) {
+                real_nvnQueueFinish = (void (*)(void*))fn;
+            }
             if (strcmp(name, "nvnQueueGetError") == 0) {
                 real_nvnQueueGetError = (int (*)(void*, void*))fn;
+            }
+            if (strcmp(name, "nvnProgramSetShaders") == 0) {
+                real_nvnProgramSetShaders = (u8 (*)(void*, int, const void*))fn;
+                return (void*)wrap_nvnProgramSetShaders;
             }
             const u64 tramp = nupTraceWrapDynamicProc("nvn_gpa", name, (u64)(uintptr_t)fn);
             if (tramp)
@@ -2435,6 +2501,11 @@ static void* hook_NvnBootstrapLoader(const char* name) {
         g_nvn_gpa_logs = 0;
         g_nvn_mempool_calls = 0;
         g_nvn_present_frames = 0;
+        g_nvn_submit_calls = 0;
+        g_nvn_shader_ok = 0;
+        g_nvn_shader_fail = 0;
+        g_nvn_dev_flags = -1;
+        g_nvn_err_logged = 0;
         nupLogf("  [trace] proxying nvnDeviceGetProcAddress for runtime NVN tracing\n");
         return (void*)hook_NvnDeviceGetProcAddress;
     }
