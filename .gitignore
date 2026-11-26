@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+*.o
+*.d
+*.lst
+*.map
+*.elf
+*.nacp
+*.nro
+*.nso
+*.nsp
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
