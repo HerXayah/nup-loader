@@ -288,30 +288,129 @@ static bool is_in_module_rodata(u64 addr) {
     return false;
 }
 
+static u64 resolve_plt_stub_target(u64 stub_addr) {
+    if ((stub_addr & 3ULL) != 0 || !is_readable_addr(stub_addr, 16))
+        return 0;
+    const u32* w = (const u32*)(uintptr_t)stub_addr;
+    // Standard AArch64 PLT stub: adrp x16, #page ; ldr x17, [x16, #off] ; add x16, x16, #off ; br x17
+    if ((w[0] & 0x9F00001Fu) == 0x90000010u && (w[1] & 0xFFC003FFu) == 0xF9400211u) {
+        s64 immhi = (s64)(s32)((w[0] << 8)) >> 13; // bits [23:5] signed (19 bits)
+        u64 immlo = (w[0] >> 29) & 3u;
+        s64 pg_off = ((immhi << 2) | (s64)immlo) << 12;
+        u64 page = (stub_addr & ~0xFFFULL) + (u64)pg_off;
+        u64 lo = (u64)((w[1] >> 10) & 0xFFFu) * 8ULL;
+        u64 got_slot = page + lo;
+        if (is_readable_addr(got_slot, 8))
+            return nupStripCodePac(*(const u64*)(uintptr_t)got_slot);
+    }
+    return 0;
+}
+
 void nupDiagDumpAbortContext(u64 caller) {
     caller = nupStripCodePac(caller);
-    // 1. Dump AArch64 instructions immediately preceding the abort call site
-    if (caller >= 0x40 && (caller & 3ULL) == 0 && is_readable_addr(caller - 0x40, 0x44)) {
-        const u32* ins = (const u32*)(uintptr_t)(caller - 0x40);
+    u64 tid = 0, tpidr = 0, tpidrro = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tpidrro));
+    nupLogf("  [abort-ctx tid=%llu] caller_pc=0x%llx tpidr_el0=0x%llx tpidrro_el0=0x%llx\n",
+            (unsigned long long)tid, (unsigned long long)(caller >= 4 ? caller - 4 : caller),
+            (unsigned long long)tpidr, (unsigned long long)tpidrro);
+
+    // 1. Dump 48 AArch64 instructions preceding abort() and decode BL/PLT targets & ADRP+ADD rodata strings
+    const u64 dump_bytes = 0xC0;
+    if (caller >= dump_bytes && (caller & 3ULL) == 0 && is_readable_addr(caller - dump_bytes, dump_bytes + 4)) {
+        const u64 base_pc = caller - dump_bytes;
+        const u32* ins = (const u32*)(uintptr_t)base_pc;
+        const u32 nins = (u32)(dump_bytes / 4);
         char cs[64];
-        nupFmtAddrMod(caller - 0x40, cs, sizeof(cs));
-        nupLogf("  [abort-code @ %s]:\n", cs);
-        for (int i = 0; i < 16; i += 4) {
+        nupFmtAddrMod(base_pc, cs, sizeof(cs));
+        nupLogf("  [abort-code @ %s (%u insns)]:\n", cs, nins);
+        for (u32 i = 0; i < nins; i += 4) {
             nupLogf("    +%02x: %08x %08x %08x %08x\n",
                     i * 4, ins[i], ins[i + 1], ins[i + 2], ins[i + 3]);
         }
+        // Track ADRP base pages per register x0..x30 to resolve ADRP+ADD strings
+        u64 adrp_page[32] = {};
+        bool adrp_valid[32] = {};
+        for (u32 i = 0; i < nins; i++) {
+            const u32 w = ins[i];
+            const u64 pc = base_pc + (u64)i * 4ULL;
+            if ((w & 0x9F000000u) == 0x90000000u) {
+                // ADRP Xd, #page
+                const u32 rd = w & 31u;
+                s64 immhi = (s64)(s32)(w << 8) >> 13;
+                u64 immlo = (w >> 29) & 3u;
+                adrp_page[rd] = (pc & ~0xFFFULL) + (u64)(((immhi << 2) | (s64)immlo) << 12);
+                adrp_valid[rd] = true;
+            } else if ((w & 0xFF800000u) == 0x91000000u) {
+                // ADD Xd, Xn, #imm12 (shift=0)
+                const u32 rd = w & 31u;
+                const u32 rn = (w >> 5) & 31u;
+                const u32 sh = (w >> 22) & 1u;
+                const u64 imm = (u64)((w >> 10) & 0xFFFu) << (sh ? 12 : 0);
+                if (adrp_valid[rn]) {
+                    const u64 target = adrp_page[rn] + imm;
+                    size_t slen = 0;
+                    if (is_in_module_rodata(target) && is_printable_str_at(target, 3, &slen)) {
+                        char pcs[64], ts[64];
+                        nupFmtAddrMod(pc, pcs, sizeof(pcs));
+                        nupFmtAddrMod(target, ts, sizeof(ts));
+                        nupLogf("  [abort-str @ %s -> %s]: '%.140s'\n", pcs, ts, (const char*)(uintptr_t)target);
+                    }
+                }
+                adrp_valid[rd] = false;
+            } else if ((w & 0xFC000000u) == 0x94000000u) {
+                // BL #imm26
+                s64 off26 = (s64)(s32)(w << 6) >> 4;
+                const u64 tgt = pc + (u64)off26;
+                const u64 plt_tgt = resolve_plt_stub_target(tgt);
+                char pcs[64], ts[64], ps[64];
+                nupFmtAddrMod(pc, pcs, sizeof(pcs));
+                nupFmtAddrMod(tgt, ts, sizeof(ts));
+                u64 soff = 0;
+                const char* sym = elfAddrToSymbol(&g_mods, plt_tgt ? plt_tgt : tgt, &soff);
+                if (plt_tgt) {
+                    nupFmtAddrMod(plt_tgt, ps, sizeof(ps));
+                    nupLogf("  [abort-bl @ %s]: BL %s -> PLT %s (%s+0x%llx)\n",
+                            pcs, ts, ps, sym ? sym : "?", (unsigned long long)(sym ? soff : 0));
+                } else {
+                    nupLogf("  [abort-bl @ %s]: BL %s (%s+0x%llx)\n",
+                            pcs, ts, sym ? sym : "?", (unsigned long long)(sym ? soff : 0));
+                }
+            }
+        }
     }
-    // 2. Scan aborting thread's stack for formatted messages / paths and rodata string pointers
-    const u64 fp = (u64)(uintptr_t)__builtin_frame_address(0);
-    if (!fp || (fp & 7ULL) != 0)
+
+    // 2. Step up out of our own diag/hook frames to the aborting caller's stack frame
+    u64 frame = (u64)(uintptr_t)__builtin_frame_address(0);
+    for (int up = 0; up < 2 && frame && (frame & 7ULL) == 0 && is_readable_addr(frame, 16); up++) {
+        u64 next = *(const u64*)(uintptr_t)frame;
+        if (!next || next <= frame || (next - frame) > 0x40000ULL)
+            break;
+        frame = next;
+    }
+    if (!frame || (frame & 7ULL) != 0)
         return;
-    // 2a. Stack pointers into module .rodata strings (first 0x600 bytes of stack)
+
+    // Intersect scan range with the thread's validated stack VMA bounds
+    MemoryInfo smi = {};
+    u32 spi = 0;
+    if (R_FAILED(svcQueryMemory(&smi, &spi, frame)) || !(smi.perm & Perm_R))
+        return;
+    const u64 stack_low = smi.addr;
+    const u64 stack_high = smi.addr + smi.size;
+    // Start slightly below caller's FP (local buffers live below FP on AArch64!)
+    const u64 scan_start = (frame > stack_low + 0x1000ULL) ? (frame - 0x1000ULL) : stack_low;
+    const u64 scan_end = (frame + 0x3000ULL < stack_high) ? (frame + 0x3000ULL) : stack_high;
+    nupLogf("  [abort-stack-range] caller_fp=0x%llx stack=[0x%llx..0x%llx) scan=[0x%llx..0x%llx)\n",
+            (unsigned long long)frame, (unsigned long long)stack_low, (unsigned long long)stack_high,
+            (unsigned long long)scan_start, (unsigned long long)scan_end);
+
+    // 2a. Stack pointers into module .rodata strings
     u32 ptr_hits = 0;
     u64 seen_ptrs[16] = {};
-    for (u64 off = 0; off < 0x600 && ptr_hits < 12; off += 8) {
-        if (!is_readable_addr(fp + off, 8))
-            break;
-        const u64 val = *(const u64*)(uintptr_t)(fp + off);
+    for (u64 addr = (scan_start & ~7ULL); addr + 8 <= scan_end && ptr_hits < 16; addr += 8) {
+        const u64 val = *(const u64*)(uintptr_t)addr;
         if (!is_in_module_rodata(val))
             continue;
         bool dup = false;
@@ -323,38 +422,36 @@ void nupDiagDumpAbortContext(u64 caller) {
             seen_ptrs[ptr_hits++] = val;
             char rs[64];
             nupFmtAddrMod(val, rs, sizeof(rs));
-            nupLogf("  [abort-rodata sp+0x%llx -> %s]: '%.120s'\n",
-                    (unsigned long long)off, rs, (const char*)(uintptr_t)val);
+            nupLogf("  [abort-rodata @ 0x%llx -> %s]: '%.120s'\n",
+                    (unsigned long long)addr, rs, (const char*)(uintptr_t)val);
         }
     }
-    // 2b. Inline ASCII strings on the stack (up to 0x3000 bytes above fp, e.g. formatted 0x400 buffers)
+    // 2b. Inline ASCII strings on caller's stack
     u32 str_hits = 0;
-    for (u64 off = 0; off < 0x3000 && str_hits < 16; ) {
-        if (!is_readable_addr(fp + off, 16))
-            break;
-        const u8* p = (const u8*)(uintptr_t)(fp + off);
+    for (u64 addr = scan_start; addr + 16 <= scan_end && str_hits < 16; ) {
+        const u8* p = (const u8*)(uintptr_t)addr;
         if (p[0] >= 0x20 && p[0] < 0x7f) {
             size_t n = 0;
-            while (off + n < 0x3000 && n < 160 && is_readable_addr(fp + off + n, 1)) {
+            while (addr + n < scan_end && n < 160) {
                 const u8 c = p[n];
                 if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c < 0x7f))
                     n++;
                 else
                     break;
             }
-            if (n >= 8 && off + n < 0x3000 && is_readable_addr(fp + off + n, 1) && p[n] == 0) {
+            if (n >= 8 && addr + n < scan_end && p[n] == 0) {
                 char clean[164];
                 size_t cp = n < 160 ? n : 160;
                 for (size_t j = 0; j < cp; j++)
                     clean[j] = (p[j] == '\n' || p[j] == '\r' || p[j] == '\t') ? ' ' : (char)p[j];
                 clean[cp] = '\0';
-                nupLogf("  [abort-stack +0x%llx]: '%s'\n", (unsigned long long)off, clean);
+                nupLogf("  [abort-stack @ 0x%llx]: '%s'\n", (unsigned long long)addr, clean);
                 str_hits++;
-                off += n + 1;
+                addr += n + 1;
                 continue;
             }
         }
-        off++;
+        addr++;
     }
     nupLogFlush();
 }
