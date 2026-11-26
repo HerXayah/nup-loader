@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitswitch2:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nup-loader
+          path: |
+            nup-loader.nro
+            nup-loader.elf
