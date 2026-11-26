@@ -42,9 +42,13 @@ static bool g_sd_open = false;
 static NupArchive g_nup = {};
 ModuleSet g_mods = {};
 
+static inline u64 strip_code_pac(u64 addr) {
+    // Horizon userland VA space is 39-bit (0..0x7f_ffff_ffff); bits 39..63 carry AArch64 PAC tags.
+    return addr & ((1ULL << 39) - 1);
+}
+
 static void fmt_addr_mod(u64 addr, char* out, size_t sz) {
-    // Strip Switch 2 PAC signature bits from return addresses
-    addr &= (1ULL << 39) - 1;
+    addr = strip_code_pac(addr);
     for (u32 i = 0; i < g_mods.count; i++) {
         const LoadedModule* m = &g_mods.mods[i];
         if (addr >= m->nso_base && addr < m->nso_base + m->total_size) {
@@ -195,9 +199,9 @@ static void on_sdk_user_exception(void* info) {
     const u64* q = (const u64*)info;
     const u32 exc_type = w[0];
     const u64 fp = q[30];
-    const u64 lr = q[31] & 0x0000ffffffffffffULL;
+    const u64 lr = strip_code_pac(q[31]);
     const u64 sp = q[32];
-    const u64 pc = q[33] & 0x0000ffffffffffffULL;
+    const u64 pc = strip_code_pac(q[33]);
     const u32 esr = w[69];
     const u64 far = q[36];
     char pc_s[64], lr_s[64];
@@ -221,7 +225,7 @@ static void on_sdk_user_exception(void* info) {
         if (!is_readable_addr(fp_addr, 16)) break;
         const u64* fpp = (const u64*)(uintptr_t)fp_addr;
         u64 next_fp = fpp[0];
-        u64 ret_lr = fpp[1] & 0x0000ffffffffffffULL;
+        u64 ret_lr = strip_code_pac(fpp[1]);
         char bt_s[64];
         fmt_addr_mod(ret_lr, bt_s, sizeof(bt_s));
         u64 soff = 0;
@@ -454,7 +458,7 @@ static void dump_abort_info(const char* tag, const void* info) {
     for (int i = 0; i < 24 && fp; i++) {
         if (!is_readable_addr((u64)(uintptr_t)fp, 16))
             break;
-        u64 lr = fp[1] & 0x0000ffffffffffffULL;
+        u64 lr = strip_code_pac(fp[1]);
         u64* nx = (u64*)(uintptr_t)fp[0];
         char bt_s[64];
         fmt_addr_mod(lr, bt_s, sizeof(bt_s));
@@ -471,6 +475,7 @@ static void dump_abort_info(const char* tag, const void* info) {
 }
 
 void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
+    caller = strip_code_pac(caller);
     u64 tid = 0;
     svcGetThreadId(&tid, CUR_THREAD_HANDLE);
     char lr_s[64];
@@ -484,7 +489,7 @@ void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
     for (int i = 0; i < 20 && fp; i++) {
         if (!is_readable_addr((u64)(uintptr_t)fp, 16))
             break;
-        u64 lr = fp[1] & 0x0000ffffffffffffULL;
+        u64 lr = strip_code_pac(fp[1]);
         u64* nx = (u64*)(uintptr_t)fp[0];
         char bt_s[64];
         fmt_addr_mod(lr, bt_s, sizeof(bt_s));
