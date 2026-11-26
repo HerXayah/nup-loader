@@ -326,8 +326,9 @@ void nupDiagDumpAbortContext(u64 caller) {
         }
     }
 
-    // 1. Dump 48 AArch64 instructions preceding abort() and decode BL/PLT targets & ADRP+ADD rodata strings
-    const u64 dump_bytes = 0xC0;
+    // 1. Dump 112 AArch64 instructions preceding abort() (captures full function prologue + guard check)
+    //    and decode BL/PLT targets & ADRP+ADD rodata strings
+    const u64 dump_bytes = 0x1C0;
     if (caller >= dump_bytes && (caller & 3ULL) == 0 && is_readable_addr(caller - dump_bytes, dump_bytes + 4)) {
         const u64 base_pc = caller - dump_bytes;
         const u32* ins = (const u32*)(uintptr_t)base_pc;
@@ -336,7 +337,7 @@ void nupDiagDumpAbortContext(u64 caller) {
         nupFmtAddrMod(base_pc, cs, sizeof(cs));
         nupLogf("  [abort-code @ %s (%u insns)]:\n", cs, nins);
         for (u32 i = 0; i < nins; i += 4) {
-            nupLogf("    +%02x: %08x %08x %08x %08x\n",
+            nupLogf("    +%03x: %08x %08x %08x %08x\n",
                     i * 4, ins[i], ins[i + 1], ins[i + 2], ins[i + 3]);
         }
         // Track ADRP base pages per register x0..x30 to resolve ADRP+ADD strings
@@ -716,6 +717,60 @@ void nupDiagDumpAbortContext(u64 caller) {
         }
     }
 
+    // 1b. One-time scan for `msr tpidr_el0, xN` in loaded game/SDK modules + worker entry dump
+    static volatile u32 g_tpidr_scan_once = 0;
+    if (__atomic_exchange_n(&g_tpidr_scan_once, 1u, __ATOMIC_ACQ_REL) == 0u) {
+        // Dump this worker's thread entry function if tracked
+        u32 wcnt = __atomic_load_n(&g_worker_count, __ATOMIC_ACQUIRE);
+        if (wcnt > MAX_TRACKED_WORKERS) wcnt = MAX_TRACKED_WORKERS;
+        for (u32 wi = 0; wi < wcnt; wi++) {
+            if (g_workers[wi].tid == tid && g_workers[wi].fn) {
+                const u64 fn = nupStripCodePac((u64)(uintptr_t)g_workers[wi].fn);
+                if ((fn & 3ULL) == 0 && is_readable_addr(fn, 0x100)) {
+                    char fns[64];
+                    nupFmtAddrMod(fn, fns, sizeof(fns));
+                    nupLogf("  [abort-worker-fn '%s' @ %s (64 insns)]:\n", g_workers[wi].name, fns);
+                    const u32* wi_ins = (const u32*)(uintptr_t)fn;
+                    for (u32 k = 0; k < 64; k += 4) {
+                        nupLogf("    +%02x: %08x %08x %08x %08x\n",
+                                k * 4, wi_ins[k], wi_ins[k + 1], wi_ins[k + 2], wi_ins[k + 3]);
+                    }
+                }
+                break;
+            }
+        }
+        // Scan non-compat modules' .text for `msr tpidr_el0, xN` (0xD51BD040..0xD51BD05F)
+        u32 hits = 0;
+        for (u32 m = 0; m < g_mods.count && hits < 12; m++) {
+            const LoadedModule* mod = &g_mods.mods[m];
+            if (mod->is_compat || !mod->rodata_off)
+                continue;
+            const u32* text = (const u32*)(uintptr_t)mod->nso_base;
+            const u32 nwords = (u32)(mod->rodata_off / 4ULL);
+            for (u32 i = 0; i < nwords && hits < 12; i++) {
+                if ((text[i] & 0xFFFFFFE0u) == 0xD51BD040u) {
+                    const u64 hit_pc = mod->nso_base + (u64)i * 4ULL;
+                    char hs[64];
+                    nupFmtAddrMod(hit_pc, hs, sizeof(hs));
+                    nupLogf("  [msr-tpidr #%u @ %s (reg=x%u)]:\n",
+                            hits, hs, text[i] & 31u);
+                    const u32 lo = (i >= 12) ? (i - 12) : 0;
+                    const u32 hi = (i + 8 <= nwords) ? (i + 8) : nwords;
+                    for (u32 k = lo; k < hi; k += 4) {
+                        u32 w0 = text[k];
+                        u32 w1 = (k + 1 < hi) ? text[k + 1] : 0;
+                        u32 w2 = (k + 2 < hi) ? text[k + 2] : 0;
+                        u32 w3 = (k + 3 < hi) ? text[k + 3] : 0;
+                        nupLogf("    +%08x: %08x %08x %08x %08x\n",
+                                k * 4, w0, w1, w2, w3);
+                    }
+                    hits++;
+                }
+            }
+        }
+        nupLogf("  [msr-tpidr scan done: %u hit(s)]\n", hits);
+    }
+
     // 2. Step up out of our own diag/hook frames to the aborting caller's stack frame
     u64 frame = (u64)(uintptr_t)__builtin_frame_address(0);
     for (int up = 0; up < 2 && frame && (frame & 7ULL) == 0 && is_readable_addr(frame, 16); up++) {
@@ -869,6 +924,11 @@ void nupOnBeforeNnMain(void) {
     // Re-register in case compat2/nninitStartup/static constructors replaced the user handler.
     nupDiagRegisterExceptionHandler(true);
     nupDiagRegisterAbortObservers();
+    u64 tpidr = 0, tpidrro = 0;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tpidrro));
+    nupLogf("[6/6] before nnMain: main tpidr_el0=0x%llx tpidrro_el0=0x%llx\n",
+            (unsigned long long)tpidr, (unsigned long long)tpidrro);
 }
 
 void nupRecordWorkerThread(void* thread_type, void* fn) {
