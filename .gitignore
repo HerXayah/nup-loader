@@ -9,7 +9,7 @@ build/
 *.nro
 *.nso
 *.nsp
-
+compile_commands.json
 # Editor / OS
 .DS_Store
 *.swp
