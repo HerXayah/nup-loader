@@ -166,6 +166,8 @@ static void (*real_LibcppVerboseAbort)(const char*, ...) = NULL;
 static void (*real_ThrowSystemError)(int, const char*) = NULL;
 static void (*real_StdAllocInit2)(void*, void*, size_t) = NULL;
 static void (*real_StdAllocInit3)(void*, void*, size_t, bool) = NULL;
+static void (*real_StdAllocCtor2)(void*, void*, size_t) = NULL;
+static u32 (*real_RoLookupSymbol)(uintptr_t*, const char*) = NULL;
 
 extern ModuleSet g_mods;
 extern void nupOnBeforeInitSdkModule(void);
@@ -2027,6 +2029,21 @@ static void hook_StdAllocInit3(void* self, void* addr, size_t size, bool is_cach
         real_StdAllocInit3(self, addr, size, is_cache);
 }
 
+static void hook_StdAllocCtor2(void* self, void* addr, size_t size) {
+    log_std_alloc_init_diag("StandardAllocator::StandardAllocator(void*, size_t)", self, addr, size, -1);
+    if (!addr && size >= 0x40000000ULL && !(real_IsVamEnabled && real_IsVamEnabled())) {
+        size_t flat_sz = size;
+        void* flat_addr = try_alloc_vam_flat_fallback(&flat_sz);
+        nupLogf("  -> [sysres=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
+        if (flat_addr) {
+            addr = flat_addr;
+            size = flat_sz;
+        }
+    }
+    if (real_StdAllocCtor2)
+        real_StdAllocCtor2(self, addr, size);
+}
+
 static void hook_QueryMemoryInfo(void* out) {
     if (real_QueryMemoryInfo) real_QueryMemoryInfo(out);
     if (out) {
@@ -2042,10 +2059,48 @@ static void hook_QueryMemoryInfo(void* out) {
             // Only clamp Switch 1 titles (01...) to 3 GiB; Switch 2 native titles (04...) need the full ~9 GiB!
             q[0] = 0xC0000000ULL;
         }
+        // hook_SetMemoryHeapSize calls svcSetHeapSize directly, so sdk's cached heap size
+        // (q[2]) stays 0 unless we report our tracked g_game_heap_size!
+        if (g_game_heap_size > 0 && q[2] == 0)
+            q[2] = g_game_heap_size;
         nupLogf("hook QueryMemoryInfo: avail=0x%llx (raw=0x%llx) used=0x%llx heap=0x%llx\n",
                 (unsigned long long)q[0], (unsigned long long)orig_avail,
                 (unsigned long long)q[1], (unsigned long long)q[2]);
     }
+}
+
+static bool hook_GetAocListChangedEvent(void* out_sys_event) {
+    // Initialize as a valid non-signaled local SystemEvent so waiting/destroying it is safe.
+    if (out_sys_event) {
+        typedef u32 (*CreateSysEvFn)(void*, int, bool);
+        const u64 fn = elfFindSymbol(&g_mods, "_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
+        if (fn)
+            ((CreateSysEvFn)(uintptr_t)fn)(out_sys_event, 0 /*ManualClear*/, false);
+    }
+    nupLogf("hook nn::aoc::GetAddOnContentListChangedEvent(%p) -> OK\n", out_sys_event);
+    return true;
+}
+
+static u32 hook_RoLookupSymbol(uintptr_t* out_addr, const char* sym_name) {
+    if (!out_addr || !sym_name || !sym_name[0])
+        return MAKERESULT(22, 5);
+    u64 addr = elfFindSymbol(&g_mods, sym_name);
+    const u64 hooked = hooksResolve(sym_name, addr);
+    if (hooked)
+        addr = hooked;
+    if (addr) {
+        if (nupTraceIsEnabled()) {
+            nupLogBufferedf("[ro_lookup] '%s' -> 0x%llx%s\n", sym_name,
+                            (unsigned long long)addr, hooked ? " [hooked]" : "");
+        }
+        *out_addr = (uintptr_t)addr;
+        return 0;
+    }
+    u32 rc = real_RoLookupSymbol ? real_RoLookupSymbol(out_addr, sym_name) : MAKERESULT(22, 5);
+    if (nupTraceIsEnabled())
+        nupLogBufferedf("[ro_lookup] '%s' -> real rc=0x%x addr=0x%llx\n",
+                        sym_name, rc, (unsigned long long)(*out_addr));
+    return rc;
 }
 
 static bool hook_IsVamEnabled(void) {
@@ -2528,6 +2583,7 @@ u64 hooksResolve(const char* sym_name, u64 real_addr) {
     HOOK_ONLY("_ZN2nn3aoc28CheckAddOnContentMountStatusEv", hook_AocOkU32);
     HOOK_ONLY("_ZN2nn3aoc23NotifyMountAddOnContentENS_3ncm6DataIdE", hook_NotifyAocDataId);
     HOOK_ONLY("_ZN2nn3aoc25NotifyUnmountAddOnContentENS_3ncm6DataIdE", hook_NotifyAocDataId);
+    HOOK_ONLY("_ZN2nn3aoc31GetAddOnContentListChangedEventEPNS_2os11SystemEventE", hook_GetAocListChangedEvent);
     HOOK_ONLY("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", hook_QueryMountAddOnContentCacheSize);
     HOOK_ONLY("_ZN2nn2fs17MountAddOnContentEPKciPvm", hook_MountAddOnContent);
 
@@ -2573,6 +2629,8 @@ u64 hooksResolve(const char* sym_name, u64 real_addr) {
     HOOK_SYM("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", hook_ViCreateLayer, real_ViCreateLayer);
     HOOK_SYM("nvnBootstrapLoader", hook_NvnBootstrapLoader, real_NvnBootstrapLoader);
     HOOK_SYM("_ZN2nn2os17SetMemoryHeapSizeEm", hook_SetMemoryHeapSize, real_SetMemoryHeapSize);
+    HOOK_ONLY("_ZN2nn2os20GetMemoryHeapAddressEv", hook_GetMemoryHeapAddress);
+    HOOK_ONLY("_ZN2nn2os17GetMemoryHeapSizeEv", hook_GetMemoryHeapSize);
     HOOK_SYM("_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE", hook_QueryMemoryInfo, real_QueryMemoryInfo);
     HOOK_SYM("_ZN2nn2os29IsVirtualAddressMemoryEnabledEv", hook_IsVamEnabled, real_IsVamEnabled);
     HOOK_SYM("_ZN2nn2os21AllocateAddressRegionEPmm", hook_AllocAddrRegion, real_AllocAddrRegion);
@@ -2587,6 +2645,8 @@ u64 hooksResolve(const char* sym_name, u64 real_addr) {
     HOOK_ONLY("_ZN2nn2os15FreeMemoryBlockEmm", hook_FreeMemoryBlock);
     HOOK_SYM("_ZN2nn3mem17StandardAllocator10InitializeEPvm", hook_StdAllocInit2, real_StdAllocInit2);
     HOOK_SYM("_ZN2nn3mem17StandardAllocator10InitializeEPvmb", hook_StdAllocInit3, real_StdAllocInit3);
+    HOOK_SYM("_ZN2nn3mem17StandardAllocatorC1EPvm", hook_StdAllocCtor2, real_StdAllocCtor2);
+    HOOK_SYM("_ZN2nn2ro12LookupSymbolEPmPKc", hook_RoLookupSymbol, real_RoLookupSymbol);
 
     // Boot & abort trace
     HOOK_SYM("_init_libc1", hook_init_libc1, real_init_libc1);
