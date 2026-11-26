@@ -82,6 +82,8 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
                        ElfAuditSummary* out_summary);
 u64 elfFindSymbol(const ModuleSet* set, const char* name);
 u64 elfFindSymbolSkipCompat1(const ModuleSet* set, const char* name);
+u64 elfFindSymbolAfterAddr(const ModuleSet* set, u64 caller_addr, const char* name,
+                           const char** out_caller_mod, const char** out_found_mod);
 const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off);
 void elfLogMatchingSymbols(const ModuleSet* set, const char* substr);
 void elfRunInitArrays(const ModuleSet* set, void (*after_sdk_cb)(void));

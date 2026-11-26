@@ -2243,13 +2243,24 @@ static void hook_AttachSysEvent(void* ev, u32 h, bool is_handle_managed, int cle
         real_AttachSysEvent(ev, h, is_handle_managed, clear_mode);
 }
 
+static volatile u32 g_gpu_err_depth = 0;
+
 static void hook_SetupGpuErrorHandler(void) {
-    if (g_in_oe_init_applet)
-        nupLogf("  [oe_init] -> nn::oe::SetupGpuErrorHandler()\n");
+    const u32 depth = __atomic_fetch_add(&g_gpu_err_depth, 1u, __ATOMIC_ACQ_REL) + 1u;
+    if (g_in_oe_init_applet || depth > 1u) {
+        nupLogf("  [oe_init] -> nn::oe::SetupGpuErrorHandler() (depth=%u, hook=%p, real=%p)\n",
+                depth, (void*)hook_SetupGpuErrorHandler, (void*)real_SetupGpuErrorHandler);
+    }
+    if (depth > 2u) {
+        nupLogf("  [oe_init] !!! RECURSION GUARD hit in hook_SetupGpuErrorHandler (depth=%u) — aborting recursion!\n", depth);
+        __atomic_fetch_sub(&g_gpu_err_depth, 1u, __ATOMIC_ACQ_REL);
+        return;
+    }
     if (real_SetupGpuErrorHandler)
         real_SetupGpuErrorHandler();
+    __atomic_fetch_sub(&g_gpu_err_depth, 1u, __ATOMIC_ACQ_REL);
     if (g_in_oe_init_applet)
-        nupLogf("  [oe_init] <- nn::oe::SetupGpuErrorHandler()\n");
+        nupLogf("  [oe_init] <- nn::oe::SetupGpuErrorHandler() returned\n");
 }
 
 static void hook_WaitSystemEvent(void* ev) {
@@ -2599,6 +2610,18 @@ u64 hooksResolve(const char* sym_name, u64 real_addr) {
     return 0;
 }
 
+static bool is_terminal_compat_hook(const char* sym_name) {
+    // Only return our hook from LookupNextSymbolForCompat for virtualized terminal
+    // subsystems (heap, SM proxy, FS/AOC VFS) that NEVER recurse back into compat1/compat2.
+    return (strcmp(sym_name, "_ZN2nn2os17SetMemoryHeapSizeEm") == 0 ||
+            strcmp(sym_name, "_ZN2nn2os19AllocateMemoryBlockEPmm") == 0 ||
+            strcmp(sym_name, "_ZN2nn2os15FreeMemoryBlockEmm") == 0 ||
+            strcmp(sym_name, "_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE") == 0 ||
+            strcmp(sym_name, "_ZN2nn2sm16GetServiceHandleEPNS_3svc6HandleEPKcm") == 0 ||
+            strncmp(sym_name, "_ZN2nn2fs", 9) == 0 ||
+            strncmp(sym_name, "_ZN2nn3aoc", 10) == 0);
+}
+
 u32 hooksLookupNextForCompat(uintptr_t* out_addr, const char* sym_name) {
     if (!out_addr || !sym_name || !sym_name[0])
         return MAKERESULT(22, 5); // 0xa16 (nn::ro SymbolNotFound)
@@ -2610,19 +2633,31 @@ u32 hooksLookupNextForCompat(uintptr_t* out_addr, const char* sym_name) {
         *out_addr = (uintptr_t)hook_GetMemoryHeapSize;
         return 0;
     }
-    u64 addr = elfFindSymbolSkipCompat1(&g_mods, sym_name);
-    const u64 hooked = hooksResolve(sym_name, addr);
-    if (hooked)
-        addr = hooked;
+
+    // Resolve strictly AFTER the calling module (compat1 -> compat2/sdk, compat2 -> sdk)
+    // so compat2 can never look up itself or recurse into a passthrough hook!
+    const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
+    const char* caller_mod = "?";
+    const char* found_mod = "?";
+    u64 addr = elfFindSymbolAfterAddr(&g_mods, caller, sym_name, &caller_mod, &found_mod);
+    bool used_hook = false;
+    if (is_terminal_compat_hook(sym_name)) {
+        const u64 hooked = hooksResolve(sym_name, addr);
+        if (hooked) {
+            addr = hooked;
+            used_hook = true;
+        }
+    }
     if (!addr) {
-        nupLogf("[compat] LookupNextSymbolForCompat('%s') -> NOT FOUND\n", sym_name);
+        nupLogf("[compat] LookupNextSymbolForCompat('%s' from %s) -> NOT FOUND\n", sym_name, caller_mod);
         *out_addr = 0;
         return MAKERESULT(22, 5); // 0xa16
     }
     if (nupTraceIsEnabled()) {
-        nupLogBufferedf("[compat_next] '%s' -> 0x%llx%s\n", sym_name,
-                        (unsigned long long)addr, hooked ? " [hooked]" : "");
-        if (!hooked) {
+        nupLogBufferedf("[compat_next] '%s' (%s -> %s) -> 0x%llx%s\n",
+                        sym_name, caller_mod, found_mod,
+                        (unsigned long long)addr, used_hook ? " [terminal-hook]" : "");
+        if (!used_hook) {
             const u64 tramp = nupTraceWrapPlt("compat_next", sym_name, addr);
             if (tramp)
                 addr = tramp;

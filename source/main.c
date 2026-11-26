@@ -772,7 +772,7 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     snprintf(audit_path, sizeof(audit_path), "/kaihen/audits/%016llx.txt",
              (unsigned long long)entry->title_id);
     nupLogInit(&g_sd, audit_path);
-    nupLogf("=== nup-loader [build=0325-trace2] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
+    nupLogf("=== nup-loader [build=0325-trace3] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
             entry->path, (unsigned long long)entry->title_id,
             entry->is_raw ? "RAW" : "NUP");
 
@@ -849,7 +849,7 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         snprintf(log_path, sizeof(log_path), "/kaihen/nup-loader.log");
     }
     nupLogInit(&g_sd, log_path);
-    nupLogf("=== nup-loader [build=0325-trace2] (%s%s): %s (tid=%016llx) ===\n",
+    nupLogf("=== nup-loader [build=0325-trace3] (%s%s): %s (tid=%016llx) ===\n",
             headless ? "headless" : "ui",
             trace_mode ? "+TRACE" : "",
             entry->path, (unsigned long long)entry->title_id);

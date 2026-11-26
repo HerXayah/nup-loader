@@ -497,6 +497,53 @@ u64 elfFindSymbolSkipCompat1(const ModuleSet* set, const char* name) {
     return find_symbol_impl(set, name, true);
 }
 
+u64 elfFindSymbolAfterAddr(const ModuleSet* set, u64 caller_addr, const char* name,
+                           const char** out_caller_mod, const char** out_found_mod) {
+    if (out_caller_mod) *out_caller_mod = "?";
+    if (out_found_mod) *out_found_mod = "?";
+    if (!set || !name || !name[0])
+        return 0;
+    const u64 clean_caller = caller_addr & 0x0000ffffffffffffULL;
+    s32 caller_idx = -1;
+    for (u32 m = 0; m < set->count; m++) {
+        const LoadedModule* mod = &set->mods[m];
+        if (clean_caller >= mod->nso_base && clean_caller < mod->nso_base + mod->total_size) {
+            caller_idx = (s32)m;
+            if (out_caller_mod) *out_caller_mod = mod->name;
+            break;
+        }
+    }
+    u64 weak_addr = 0;
+    const char* weak_mod = "?";
+    for (u32 m = 0; m < set->count; m++) {
+        const LoadedModule* mod = &set->mods[m];
+        if (caller_idx >= 0) {
+            if ((s32)m <= caller_idx)
+                continue;
+        } else {
+            // Caller not inside a tracked module: skip all compat modules so we never loop back
+            if (mod->is_compat)
+                continue;
+        }
+        bool is_weak = false;
+        const u64 addr = lookup_in_module(mod, name, &is_weak);
+        if (addr) {
+            if (is_weak) {
+                if (!weak_addr) {
+                    weak_addr = addr;
+                    weak_mod = mod->name;
+                }
+            } else {
+                if (out_found_mod) *out_found_mod = mod->name;
+                return addr;
+            }
+        }
+    }
+    if (weak_addr && out_found_mod)
+        *out_found_mod = weak_mod;
+    return weak_addr;
+}
+
 typedef struct {
     struct {
         const void* ptr;
@@ -584,7 +631,8 @@ bool elfAttachSwitch1Compat(ModuleSet* set, u64 target_tid) {
             continue;
         bool already_loaded = false;
         for (u32 m = 0; m < set->count; m++) {
-            if (mi.addr >= set->mods[m].nro_base &&
+            if (set->mods[m].nro_base &&
+                mi.addr >= set->mods[m].nro_base &&
                 mi.addr < set->mods[m].nso_base + set->mods[m].total_size) {
                 already_loaded = true;
                 break;
@@ -1186,18 +1234,40 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
         sum.trace_selected = sel_total;
         sum.trace_need_tramp = sel_need;
         nupLogBufferedf("\n--- PLT TRACE CAPACITY ---\n");
-        nupLogBufferedf("  Total JUMP_SLOT relocations:  %u (GLOB_DAT: %u)\n",
+        nupLogBufferedf("  Total JUMP_SLOT relocations:   %u (GLOB_DAT: %u)\n",
                         sum.total_jmprel, sum.total_glob_dat);
-        nupLogBufferedf("  Selected imports (per-mod):   %u\n", sel_total);
-        nupLogBufferedf("  Already hooked:               %u\n", sel_hooked);
-        nupLogBufferedf("  Need trampolines (upper bnd): %u\n", sel_need);
-        nupLogBufferedf("  Available trampolines:        %u\n", NUP_TRACE_MAX_SLOTS);
+        nupLogBufferedf("  Selected trace imports:        %u\n", sel_total);
+        nupLogBufferedf("  Already hooked (in selected):  %u\n", sel_hooked);
+        nupLogBufferedf("  Need trampolines (upper bnd):  %u\n", sel_need);
+        nupLogBufferedf("  Available trampolines:         %u\n", NUP_TRACE_MAX_SLOTS);
         if (sel_need <= NUP_TRACE_MAX_SLOTS)
-            nupLogBufferedf("  Capacity:                     OK\n");
+            nupLogBufferedf("  Capacity:                      OK\n");
         else
-            nupLogBufferedf("  Capacity:                     EXCEEDED by %u (dedup may reduce)\n",
+            nupLogBufferedf("  Capacity:                      EXCEEDED by %u (dedup may reduce)\n",
                             sel_need - NUP_TRACE_MAX_SLOTS);
         nupLogBufferedf("  Coverage: JUMP_SLOT=Yes | GLOB_DAT(func)=Yes | nvnDeviceGetProcAddress=Proxy | intra-module/SVC=No\n");
+    }
+
+    {
+        bool has_c1 = false, has_c2 = false;
+        for (u32 m = 0; m < set->count; m++) {
+            if (strcmp(set->mods[m].name, "compat1") == 0) has_c1 = true;
+            if (strcmp(set->mods[m].name, "compat2") == 0) has_c2 = true;
+        }
+        nupLogBufferedf("\n--- MODULE COVERAGE & AUDIT COMPLETENESS ---\n");
+        for (u32 m = 0; m < set->count; m++) {
+            const LoadedModule* mod = &set->mods[m];
+            nupLogBufferedf("  %-8s [%s] discovered=YES syms=%u jmprel=%llu traceable=%s\n",
+                            mod->name, mod->is_compat ? "COMPAT" : "TARGET",
+                            mod->sym_count,
+                            (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
+                            strcmp(mod->name, "sdk") == 0 ? "NO(callee)" : "YES");
+        }
+        if (!has_c1) nupLogBufferedf("  compat1  [COMPAT] discovered=NO\n");
+        if (!has_c2) nupLogBufferedf("  compat2  [COMPAT] discovered=NO\n");
+        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | TRACE_POOL=%s\n",
+                        (has_c1 && has_c2) ? "COMPLETE" : ((has_c1 || has_c2) ? "PARTIAL" : "NONE/N/A"),
+                        sum.trace_need_tramp <= NUP_TRACE_MAX_SLOTS ? "OK" : "EXCEEDED");
     }
 
     static const char* const pass_titles[4] = {
