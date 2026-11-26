@@ -1434,6 +1434,24 @@ void elfInitSwitch1CompatParams(const ModuleSet* set) {
     }
     g_compat_param.region_count = rcnt;
 
+    const u64 get_param_fn = elfFindSymbol(set, "_ZN2nn6compat6detail25GetCompatibilityParameterEv");
+    if (get_param_fn) {
+        const NupCompatParam* existing = ((const NupCompatParam* (*)(void))(uintptr_t)get_param_fn)();
+        if (existing) {
+            nupLogf("[compat] pre-existing CompatParam @ %p (regions=%d ctl=[0x%llx,0x%llx,0x%llx,0x%llx])\n",
+                    (const void*)existing, existing->region_count,
+                    (unsigned long long)existing->graphics_ctl,
+                    (unsigned long long)existing->movie_ctl,
+                    (unsigned long long)existing->audio_ctl,
+                    (unsigned long long)existing->misc_ctl);
+            if (!g_kernel_compat_param) {
+                g_compat_param.graphics_ctl = existing->graphics_ctl;
+                g_compat_param.movie_ctl = existing->movie_ctl;
+                g_compat_param.audio_ctl = existing->audio_ctl;
+                g_compat_param.misc_ctl = existing->misc_ctl;
+            }
+        }
+    }
     const u64 set_param_fn = elfFindSymbol(set, "_ZN2nn6compat6detail25SetCompatibilityParameterEPNS0_22CompatibilityParameterE");
     const u64 extract_ver_fn = elfFindSymbol(set, "_ZN2nn6compat6detail26ExtractSdkVersionForCompatEv");
     const u64 set_ver_fn = elfFindSymbol(set, "_ZN2nn6compat6detail22SetSdkVersionForCompatERKNS0_10SdkVersionE");

@@ -2457,29 +2457,36 @@ static void wrap_nvnQueueSubmitCommands(void* q, int numCommands, const u64* han
                                 (unsigned long long)pq[2], (unsigned long long)pq[3]);
                     }
                 }
-                if (hooks_is_readable(ctrl, 0x200)) {
+                if (hooks_is_readable(ctrl, 0x80)) {
                     const u64* cq = (const u64*)(uintptr_t)ctrl;
-                    for (u32 k = 0; k < 64; k += 4) {
-                        nupLogf("    ctrl+%03x: %016llx %016llx %016llx %016llx\n",
+                    for (u32 k = 0; k < 16; k += 4) {
+                        nupLogf("    ctrl+%02x: %016llx %016llx %016llx %016llx\n",
                                 k * 8,
                                 (unsigned long long)cq[k], (unsigned long long)cq[k + 1],
                                 (unsigned long long)cq[k + 2], (unsigned long long)cq[k + 3]);
                     }
-                    // Dump first 2 distinct readable command/pushbuffer pointers referenced by ctrl
-                    u32 dumped_bufs = 0;
-                    u64 seen_bufs[2] = {};
-                    for (u32 k = 0; k < 32 && dumped_bufs < 2; k++) {
-                        const u64 cand = cq[k];
-                        if (cand && cand != ctrl && (cand & 3ULL) == 0 &&
-                            cand > 0x10000000ULL && hooks_is_readable(cand, 0x100)) {
-                            if (dumped_bufs == 1 && seen_bufs[0] == cand) continue;
-                            seen_bufs[dumped_bufs++] = cand;
-                            const u32* cw = (const u32*)(uintptr_t)cand;
-                            nupLogf("    [cmdbuf #%u @ ctrl+%03x -> 0x%llx (64 words)]:\n",
-                                    dumped_bufs, k * 8, (unsigned long long)cand);
-                            for (u32 j = 0; j < 64; j += 4) {
-                                nupLogf("      +%02x: %08x %08x %08x %08x\n",
-                                        j * 4, cw[j], cw[j + 1], cw[j + 2], cw[j + 3]);
+                    // Walk NVN GPFIFO segment entries: { u64 gpu, u64 cpu, u32 nwords, u32 flags } (24 bytes each)
+                    u32 nsegs = (u32)(h >> 48);
+                    if (nsegs == 0 || nsegs > 8) nsegs = 4;
+                    for (u32 sg = 0; sg < nsegs; sg++) {
+                        const u64 ent = ctrl + (u64)sg * 24ULL;
+                        if (!hooks_is_readable(ent, 24)) break;
+                        const u64 gpu = *(const u64*)(uintptr_t)(ent + 0);
+                        const u64 cpu = *(const u64*)(uintptr_t)(ent + 8);
+                        const u32 nw  = *(const u32*)(uintptr_t)(ent + 16);
+                        const u32 flg = *(const u32*)(uintptr_t)(ent + 20);
+                        nupLogf("    [seg #%u gpu=0x%llx cpu=0x%llx nwords=%u flags=0x%x]:\n",
+                                sg, (unsigned long long)gpu, (unsigned long long)cpu, nw, flg);
+                        u32 dump_w = nw;
+                        if (dump_w > 96) dump_w = 96;
+                        if (cpu && (cpu & 3ULL) == 0 && dump_w > 0 && hooks_is_readable(cpu, (u64)dump_w * 4ULL)) {
+                            const u32* cw = (const u32*)(uintptr_t)cpu;
+                            for (u32 j = 0; j < dump_w; j += 4) {
+                                u32 w0 = cw[j];
+                                u32 w1 = (j + 1 < dump_w) ? cw[j + 1] : 0;
+                                u32 w2 = (j + 2 < dump_w) ? cw[j + 2] : 0;
+                                u32 w3 = (j + 3 < dump_w) ? cw[j + 3] : 0;
+                                nupLogf("      +%02x: %08x %08x %08x %08x\n", j * 4, w0, w1, w2, w3);
                             }
                         }
                     }
