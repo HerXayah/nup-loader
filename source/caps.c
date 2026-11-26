@@ -154,7 +154,7 @@ void nupLogRuntimeCaps(const NupRuntimeCapabilities* c) {
     nupLogBufferedf("\n--- HOST / DONOR CAPABILITIES ---\n");
     nupLogBufferedf("  Donor ProgramId:           %016llx\n", (unsigned long long)c->donor_pid);
     nupLogBufferedf("  Platform stack:            %s\n", donor_stack);
-    nupLogBufferedf("  Ordinary process memory:   used=0x%llx / total=0x%llx (free=%llu MiB)\n",
+    nupLogBufferedf("  Ordinary process memory:   used=0x%llx / total=0x%llx (free=%llu MiB, pre-shrink host heap)\n",
                     (unsigned long long)c->donor_mem_used, (unsigned long long)c->donor_mem_total,
                     (unsigned long long)(donor_free / (1024ULL * 1024ULL)));
     nupLogBufferedf("  System resource capacity:  %llu MiB (0x%llx, used=0x%llx)\n",
@@ -205,7 +205,7 @@ void nupLogRuntimeCaps(const NupRuntimeCapabilities* c) {
     nupLogBufferedf("  System resource:           RUNTIME-BOUNDED (donor=%llu MiB vs declared=%u MiB)\n",
                     (unsigned long long)(c->donor_sysres_total / (1024ULL * 1024ULL)),
                     c->target_sysres_required / (1024u * 1024u));
-    nupLogBufferedf("  Ordinary process memory:   RUNTIME-BOUNDED (donor free=%llu MiB)\n",
+    nupLogBufferedf("  Ordinary process memory:   RUNTIME-BOUNDED (pre-shrink free=%llu MiB; host heap reclaimed at handoff)\n",
                     (unsigned long long)(donor_free / (1024ULL * 1024ULL)));
     if (c->donor_remote_valid) {
         const bool less = c->target_npdm_valid && c->donor_remote_total < (u64)c->target_remote_required;

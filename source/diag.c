@@ -30,6 +30,7 @@ static Thread g_hb_thread;
 static alignas(0x1000) u8 g_hb_stack[0x4000];
 static Handle g_main_thread_handle = INVALID_HANDLE;
 static u64 g_sysres_hwm = 0;
+static u64 g_remote_hwm = 0;
 
 #define MAX_TRACKED_WORKERS 64
 typedef struct {
@@ -263,6 +264,7 @@ void nupDiagReset(void) {
     g_sdk_ex_registered = false;
     g_worker_count = 0;
     g_sysres_hwm = 0;
+    g_remote_hwm = 0;
 }
 
 void nupDiagRegisterExceptionHandler(bool force) {
@@ -379,27 +381,38 @@ static void update_sysres_hwm(u64 cur) {
 
 static void log_heartbeat_stats(u32 sec) {
     u64 used = 0, sys_used = 0, sys_tot = 0, ns_used = 0, ns_tot = 0;
+    u64 rem_used = 0, rem_tot = 0;
     Result urc = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&ns_used, InfoType_UsedNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&ns_tot, InfoType_TotalNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
+    const bool has_rem = R_SUCCEEDED(svcGetInfo(&rem_tot, 31, CUR_PROCESS_HANDLE, 0));
+    if (has_rem) {
+        svcGetInfo(&rem_used, 32, CUR_PROCESS_HANDLE, 0);
+        if (rem_used > g_remote_hwm)
+            g_remote_hwm = rem_used;
+    }
     update_sysres_hwm(sys_used);
     if (nupTraceIsEnabled()) {
-        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx(hwm=0x%llx) files=%u workers=%u reent=%u tr_seq=%llu drop=%llu\n",
+        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx(hwm=0x%llx) gpu=0x%llx/0x%llx(hwm=0x%llx) files=%u workers=%u reent=%u tr_seq=%llu drop=%llu\n",
                 sec, (unsigned long long)used, urc,
                 (unsigned long long)ns_used, (unsigned long long)ns_tot,
                 (unsigned long long)sys_used, (unsigned long long)sys_tot,
                 (unsigned long long)g_sysres_hwm,
+                (unsigned long long)rem_used, (unsigned long long)rem_tot,
+                (unsigned long long)g_remote_hwm,
                 g_open_file_count, g_worker_count, g_bad_reent_count,
                 (unsigned long long)nupTraceTotalSeq(),
                 (unsigned long long)nupTraceDroppedCount());
     } else {
-        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx(hwm=0x%llx) files=%u workers=%u reent=%u\n",
+        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx(hwm=0x%llx) gpu=0x%llx/0x%llx(hwm=0x%llx) files=%u workers=%u reent=%u\n",
                 sec, (unsigned long long)used, urc,
                 (unsigned long long)ns_used, (unsigned long long)ns_tot,
                 (unsigned long long)sys_used, (unsigned long long)sys_tot,
                 (unsigned long long)g_sysres_hwm,
+                (unsigned long long)rem_used, (unsigned long long)rem_tot,
+                (unsigned long long)g_remote_hwm,
                 g_open_file_count, g_worker_count, g_bad_reent_count);
     }
 }
