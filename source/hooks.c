@@ -2116,10 +2116,10 @@ static void hook_QueryMemoryInfo(void* out) {
             if (g_compat_heap_marked || !g_caps.has_compat2) {
                 // Report retail Switch 1 application RAM ceiling (3,285 MiB) and base
                 // game-visible free memory directly on actual remaining physical RAM
-                // minus 256 MiB headroom (covers transient ~100 MiB sub-heap carve-outs
-                // during nninitStartup plus Horizon/NVN/thread allocations).
+                // minus 384 MiB headroom (covers ~290 MiB boot asset/shader/NVN spikes
+                // before StandardAllocator trims its cached pre-warm pool).
                 const u64 sw1_avail = (orig_avail < 0xCD500000ULL) ? orig_avail : 0xCD500000ULL;
-                const u64 safe_free = (real_free > 0x10000000ULL) ? (real_free - 0x10000000ULL) : 0ULL;
+                const u64 safe_free = (real_free > 0x18000000ULL) ? (real_free - 0x18000000ULL) : 0ULL;
                 const u64 max_game_free = (sw1_avail > 0x8000000ULL) ? (sw1_avail - 0x8000000ULL) : sw1_avail;
                 const u64 game_free = (safe_free < max_game_free) ? safe_free : max_game_free;
                 q[0] = sw1_avail;
@@ -2319,6 +2319,8 @@ static u8 (*real_nvnQueueInitialize)(void*, const void*) = NULL;
 static u8 (*real_nvnWindowInitialize)(void*, const void*) = NULL;
 static u8 (*real_nvnMemoryPoolInitialize)(void*, const void*) = NULL;
 static void (*real_nvnQueuePresentTexture)(void*, void*, int) = NULL;
+static int (*real_nvnQueueGetError)(void*, void*) = NULL;
+static void* g_last_nvn_queue = NULL;
 static u32 g_nvn_gpa_logs = 0;
 static u32 g_nvn_mempool_calls = 0;
 static u32 g_nvn_present_frames = 0;
@@ -2346,6 +2348,8 @@ static u8 wrap_nvnDeviceInitialize(void* dev, const void* builder) {
 static u8 wrap_nvnQueueInitialize(void* q, const void* builder) {
     nupLogf("[nvn] nvnQueueInitialize(q=%p, builder=%p) ENTER\n", q, builder);
     const u8 ok = real_nvnQueueInitialize ? real_nvnQueueInitialize(q, builder) : 0;
+    if (ok && q)
+        g_last_nvn_queue = q;
     u64 gu = 0, gt = 0;
     log_gpu_remote_inline(&gu, &gt);
     nupLogf("[nvn] nvnQueueInitialize(q=%p) -> %u (gpu=%llu/%llu MiB)\n",
@@ -2411,6 +2415,9 @@ static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
             if (strcmp(name, "nvnQueuePresentTexture") == 0) {
                 real_nvnQueuePresentTexture = (void (*)(void*, void*, int))fn;
                 return (void*)wrap_nvnQueuePresentTexture;
+            }
+            if (strcmp(name, "nvnQueueGetError") == 0) {
+                real_nvnQueueGetError = (int (*)(void*, void*))fn;
             }
             const u64 tramp = nupTraceWrapDynamicProc("nvn_gpa", name, (u64)(uintptr_t)fn);
             if (tramp)
@@ -2713,6 +2720,20 @@ static void hook_GetProcessNamePointer(const char** out_name, u64* out_len) {
 
 static void hook_AbortImpl0(void) {
     const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
+    if (g_last_nvn_queue && real_nvnQueueGetError) {
+        u64 info[8] = {};
+        const int qerr = real_nvnQueueGetError(g_last_nvn_queue, info);
+        u64 gu = 0, gt = 0;
+        log_gpu_remote_inline(&gu, &gt);
+        nupLogf("!!! [nvn] nvnQueueGetError(q=%p) -> err=%d frames=%u pools=%u gpu=%llu/%llu MiB\n",
+                g_last_nvn_queue, qerr, g_nvn_present_frames, g_nvn_mempool_calls,
+                (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+        nupLogf("    [nvn-err-info]: %016llx %016llx %016llx %016llx | %016llx %016llx %016llx %016llx\n",
+                (unsigned long long)info[0], (unsigned long long)info[1],
+                (unsigned long long)info[2], (unsigned long long)info[3],
+                (unsigned long long)info[4], (unsigned long long)info[5],
+                (unsigned long long)info[6], (unsigned long long)info[7]);
+    }
     nupLogBacktrace("nn::diag::detail::AbortImpl()", caller, 0, 0);
     if (real_AbortImpl0) real_AbortImpl0();
 }
