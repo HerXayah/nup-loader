@@ -2442,30 +2442,45 @@ static void wrap_nvnQueueSubmitCommands(void* q, int numCommands, const u64* han
             if (err != 0) {
                 g_nvn_err_logged = 1;
                 const u64 h = handles[i];
-                const u64 ctrl = h & 0x0000FFFFFFFFFFFFULL;
-                nupLogf("!!! [nvn] FAULT at submit #%u cmd[%d/%d] handle=0x%llx -> err=%d (shaders=%u/%u pools=%u)\n",
-                        s, i, numCommands, (unsigned long long)h, err,
+                const u64 ctrl = h & 0x0000FFFFFFFFFFF8ULL;
+                nupLogf("!!! [nvn] FAULT at submit #%u cmd[%d/%d] handle=0x%llx ctrl=0x%llx -> err=%d (shaders=%u/%u pools=%u)\n",
+                        s, i, numCommands, (unsigned long long)h, (unsigned long long)ctrl, err,
                         g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
-                if ((ctrl & 7ULL) == 0 && hooks_is_readable(ctrl, 0x80)) {
+                // Also log handles of cmd[0..i] for comparison
+                for (int p = 0; p < i && p < 8; p++) {
+                    const u64 pc = handles[p] & 0x0000FFFFFFFFFFF8ULL;
+                    if (hooks_is_readable(pc, 0x20)) {
+                        const u64* pq = (const u64*)(uintptr_t)pc;
+                        nupLogf("    ok cmd[%d] h=0x%llx: %016llx %016llx %016llx %016llx\n",
+                                p, (unsigned long long)handles[p],
+                                (unsigned long long)pq[0], (unsigned long long)pq[1],
+                                (unsigned long long)pq[2], (unsigned long long)pq[3]);
+                    }
+                }
+                if (hooks_is_readable(ctrl, 0x200)) {
                     const u64* cq = (const u64*)(uintptr_t)ctrl;
-                    for (u32 k = 0; k < 16; k += 4) {
-                        nupLogf("    ctrl+%02x: %016llx %016llx %016llx %016llx\n",
+                    for (u32 k = 0; k < 64; k += 4) {
+                        nupLogf("    ctrl+%03x: %016llx %016llx %016llx %016llx\n",
                                 k * 8,
                                 (unsigned long long)cq[k], (unsigned long long)cq[k + 1],
                                 (unsigned long long)cq[k + 2], (unsigned long long)cq[k + 3]);
                     }
-                    // Also dump Maxwell pushbuffer words if any ctrl qword points to readable command memory
-                    for (u32 k = 0; k < 8; k++) {
+                    // Dump first 2 distinct readable command/pushbuffer pointers referenced by ctrl
+                    u32 dumped_bufs = 0;
+                    u64 seen_bufs[2] = {};
+                    for (u32 k = 0; k < 32 && dumped_bufs < 2; k++) {
                         const u64 cand = cq[k];
                         if (cand && cand != ctrl && (cand & 3ULL) == 0 &&
-                            cand > 0x10000000ULL && hooks_is_readable(cand, 0x80)) {
+                            cand > 0x10000000ULL && hooks_is_readable(cand, 0x100)) {
+                            if (dumped_bufs == 1 && seen_bufs[0] == cand) continue;
+                            seen_bufs[dumped_bufs++] = cand;
                             const u32* cw = (const u32*)(uintptr_t)cand;
-                            nupLogf("    [cmdbuf @ ctrl+%02x -> 0x%llx (32 words)]:\n", k * 8, (unsigned long long)cand);
-                            for (u32 j = 0; j < 32; j += 4) {
+                            nupLogf("    [cmdbuf #%u @ ctrl+%03x -> 0x%llx (64 words)]:\n",
+                                    dumped_bufs, k * 8, (unsigned long long)cand);
+                            for (u32 j = 0; j < 64; j += 4) {
                                 nupLogf("      +%02x: %08x %08x %08x %08x\n",
                                         j * 4, cw[j], cw[j + 1], cw[j + 2], cw[j + 3]);
                             }
-                            break;
                         }
                     }
                 }
