@@ -1340,8 +1340,10 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
 const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off) {
     if (!set)
         return NULL;
-    const char* best = NULL;
-    u64 bv = 0;
+    const char* exact = NULL;
+    u64 exact_v = 0;
+    const char* near = NULL;
+    u64 near_v = 0;
     for (u32 m = 0; m < set->count; m++) {
         const LoadedModule* mod = &set->mods[m];
         if (!mod->symtab || !mod->strtab)
@@ -1352,18 +1354,33 @@ const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off) {
         for (u32 i = 1; i < mod->sym_count; i++) {
             if (!s[i].st_shndx || !s[i].st_value || s[i].st_name >= mod->strsz)
                 continue;
-            if ((s[i].st_info & 0xf) != 2) /* STT_FUNC */
+            const u8 stype = (u8)(s[i].st_info & 0xf);
+            if (stype != 2 /* STT_FUNC */ &&
+                !(stype == 0 /* STT_NOTYPE */ && s[i].st_value < mod->rodata_off))
                 continue;
             const u64 a = mod->nso_base + s[i].st_value;
-            if (a <= addr && a > bv && (!s[i].st_size || addr < a + s[i].st_size)) {
-                bv = a;
-                best = mod->strtab + s[i].st_name;
+            if (a > addr)
+                continue;
+            // Allow addr == a + st_size because LR after a noreturn tail call sits right at the end.
+            if ((!s[i].st_size || addr <= a + s[i].st_size) && a >= exact_v) {
+                exact_v = a;
+                exact = mod->strtab + s[i].st_name;
+            }
+            if (a >= near_v && (addr - a) < 0x10000ULL) {
+                near_v = a;
+                near = mod->strtab + s[i].st_name;
             }
         }
     }
-    if (best && out_off)
-        *out_off = addr - bv;
-    return best;
+    if (exact) {
+        if (out_off) *out_off = addr - exact_v;
+        return exact;
+    }
+    if (near) {
+        if (out_off) *out_off = addr - near_v;
+        return near;
+    }
+    return NULL;
 }
 
 void elfLogMatchingSymbols(const ModuleSet* set, const char* substr) {
