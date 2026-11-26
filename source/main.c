@@ -442,8 +442,12 @@ static void dump_abort_info(const char* tag, const void* info) {
             }
         }
         dump_hex_bytes("info[1]", q[1], 0x40);
-        if (q[2] != q[1])
-            dump_hex_bytes("info[2]", q[2], 0x20);
+        if (q[2] != q[1]) {
+            if (is_readable_addr(q[2], 1) && *(const u8*)(uintptr_t)q[2] == 0)
+                nupLogf("  info[2] @ 0x%llx: \"\" (empty string)\n", (unsigned long long)q[2]);
+            else
+                dump_hex_bytes("info[2]", q[2], 0x20);
+        }
     }
     // Walk AArch64 frame pointer chain
     u64* fp = (u64*)__builtin_frame_address(0);
@@ -776,10 +780,10 @@ static void log_runtime_caps(const NupRuntimeCapabilities* c) {
         nupLogBufferedf("  Target requirement:        %u MiB (0x%x)\n",
                         c->target_sysres_required / (1024u * 1024u), c->target_sysres_required);
         if (c->sysres_sufficient) {
-            nupLogBufferedf("  Resource requirement:      SUFFICIENT\n");
+            nupLogBufferedf("  NPDM_SYSRES check:         SUFFICIENT (static NPDM cap only; runtime heap/VAM tracked live)\n");
         } else {
             const u64 short_bytes = (u64)c->target_sysres_required - c->donor_sysres_total;
-            nupLogBufferedf("  Resource requirement:      INSUFFICIENT (short by %llu MiB / 0x%llx)\n",
+            nupLogBufferedf("  NPDM_SYSRES check:         INSUFFICIENT (short by %llu MiB / 0x%llx)\n",
                             (unsigned long long)(short_bytes / (1024ULL * 1024ULL)),
                             (unsigned long long)short_bytes);
         }

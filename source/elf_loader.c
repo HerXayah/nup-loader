@@ -1286,7 +1286,7 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
         }
         if (needs_compat && !has_c1) nupLogBufferedf("  compat1  [COMPAT] discovered=NO\n");
         if (needs_compat && !has_c2) nupLogBufferedf("  compat2  [COMPAT] discovered=NO\n");
-        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | SYSRES=%s | TRACE_POOL=%s\n",
+        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | NPDM_SYSRES=%s | TRACE_POOL=%s\n",
                         compat_state,
                         (caps && caps->target_npdm_valid)
                             ? (caps->sysres_sufficient ? "SUFFICIENT" : "INSUFFICIENT")

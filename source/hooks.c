@@ -196,6 +196,7 @@ static u64 g_game_heap_cursor = 0;
 static u64 g_compat_heap_reserved = 0;
 static bool g_compat_heap_marked = false;
 static u64 g_vam_flat_used = 0;
+static u64 g_vam_backed_bytes = 0;
 static u32 g_std_alloc_init_logs = 0;
 
 // --- TLS-free path formatting helpers ---
@@ -578,6 +579,7 @@ void hooksInit(NupArchive* nup, FsFileSystem* sd,
     g_compat_heap_reserved = 0;
     g_compat_heap_marked = false;
     g_vam_flat_used = 0;
+    g_vam_backed_bytes = 0;
     g_std_alloc_init_logs = 0;
     nupSpinInit(&g_handle_lock);
 
@@ -2235,22 +2237,32 @@ static u32 hook_AllocMemPages(u64 addr, size_t size) {
 
     const u32 rc = real_AllocMemPages ? real_AllocMemPages(addr, size) : MAKERESULT(3, 102);
     g_alloc_pages_count++;
+    if (R_SUCCEEDED(rc))
+        g_vam_backed_bytes += size;
     if (R_FAILED(rc)) {
-        u64 sys_tot = 0, sys_used = 0;
+        u64 sys_tot = 0, sys_used = 0, mem_tot = 0, mem_used = 0;
         svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
-        nupLogf("hook AllocateMemoryPages(addr=0x%llx, size=0x%zx) -> FAILED 0x%x (calls=%u sysres=0x%llx/0x%llx)\n",
+        svcGetInfo(&mem_tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&mem_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        const u64 phys_free = (mem_tot > mem_used) ? (mem_tot - mem_used) : 0;
+        nupLogf("hook AllocateMemoryPages(addr=0x%llx, size=0x%zx) -> FAILED 0x%x (calls=%u backed=0x%llx phys_free=0x%llx sysres=0x%llx/0x%llx)\n",
                 (unsigned long long)addr, size, rc, g_alloc_pages_count,
+                (unsigned long long)g_vam_backed_bytes, (unsigned long long)phys_free,
                 (unsigned long long)sys_used, (unsigned long long)sys_tot);
     } else if ((g_probe_capped && g_post_cap_logs < 16) ||
                size >= 0x1000000 || g_alloc_pages_logs < 6 || (g_alloc_pages_count % 512) == 0) {
         if (g_probe_capped) g_post_cap_logs++;
         else g_alloc_pages_logs++;
-        u64 sys_tot = 0, sys_used = 0;
+        u64 sys_tot = 0, sys_used = 0, mem_tot = 0, mem_used = 0;
         svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
-        nupLogf("hook AllocateMemoryPages #%u(addr=0x%llx, size=0x%zx) -> 0x%x (sysres=0x%llx/0x%llx)\n",
+        svcGetInfo(&mem_tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&mem_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        const u64 phys_free = (mem_tot > mem_used) ? (mem_tot - mem_used) : 0;
+        nupLogf("hook AllocateMemoryPages #%u(addr=0x%llx, size=0x%zx) -> 0x%x (backed=0x%llx phys_free=0x%llx sysres=0x%llx/0x%llx)\n",
                 g_alloc_pages_count, (unsigned long long)addr, size, rc,
+                (unsigned long long)g_vam_backed_bytes, (unsigned long long)phys_free,
                 (unsigned long long)sys_used, (unsigned long long)sys_tot);
     }
     return rc;
@@ -2258,13 +2270,17 @@ static u32 hook_AllocMemPages(u64 addr, size_t size) {
 
 static u32 hook_FreeMemPages(u64 addr, size_t size) {
     const u32 rc = real_FreeMemPages ? real_FreeMemPages(addr, size) : MAKERESULT(3, 102);
+    if (R_SUCCEEDED(rc)) {
+        if (g_vam_backed_bytes >= size) g_vam_backed_bytes -= size;
+        else g_vam_backed_bytes = 0;
+    }
     if (R_FAILED(rc) || size >= 0x1000000 || g_free_pages_logs < 8) {
         g_free_pages_logs++;
         u64 sys_tot = 0, sys_used = 0;
         svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
-        nupLogf("hook FreeMemoryPages(addr=0x%llx, size=0x%zx) -> 0x%x (sysres=0x%llx/0x%llx)\n",
-                (unsigned long long)addr, size, rc,
+        nupLogf("hook FreeMemoryPages(addr=0x%llx, size=0x%zx) -> 0x%x (backed=0x%llx sysres=0x%llx/0x%llx)\n",
+                (unsigned long long)addr, size, rc, (unsigned long long)g_vam_backed_bytes,
                 (unsigned long long)sys_used, (unsigned long long)sys_tot);
     }
     return rc;
