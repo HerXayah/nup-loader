@@ -57,7 +57,13 @@ typedef struct {
     u32 hooked_count;
     u32 unhooked_fs_aoc;
     u32 unhooked_sys;
+    u32 total_jmprel;
+    u32 total_glob_dat;
+    u32 total_tlsdesc;
+    u32 trace_selected;
+    u32 trace_need_tramp;
     bool has_compat;
+    bool has_modobj20;
     char entry_kind[16];
 } ElfAuditSummary;
 

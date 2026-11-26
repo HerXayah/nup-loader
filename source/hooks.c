@@ -2,6 +2,7 @@
 #include "hooks.h"
 #include "elf_loader.h"
 #include "log.h"
+#include "trace.h"
 
 #include <string.h>
 
@@ -2142,9 +2143,34 @@ static u32 hook_ViCreateLayer(void** out, void* disp) {
     return rc;
 }
 
+static void* (*real_NvnDeviceGetProcAddress)(void*, const char*) = NULL;
+static u32 g_nvn_gpa_logs = 0;
+
+static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
+    void* fn = real_NvnDeviceGetProcAddress ? real_NvnDeviceGetProcAddress(dev, name) : NULL;
+    if (nupTraceIsEnabled() && name && name[0]) {
+        if (g_nvn_gpa_logs < 64) {
+            g_nvn_gpa_logs++;
+            nupLogBufferedf("  [nvn_gpa #%u] '%s' -> %p\n", g_nvn_gpa_logs, name, fn);
+        }
+        if (fn) {
+            const u64 tramp = nupTraceWrapDynamicProc("nvn_gpa", name, (u64)(uintptr_t)fn);
+            if (tramp)
+                return (void*)(uintptr_t)tramp;
+        }
+    }
+    return fn;
+}
+
 static void* hook_NvnBootstrapLoader(const char* name) {
     void* r = real_NvnBootstrapLoader ? real_NvnBootstrapLoader(name) : NULL;
     nupLogf("hook nvnBootstrapLoader('%s') -> %p\n", name ? name : "", r);
+    if (nupTraceIsEnabled() && r && name && strcmp(name, "nvnDeviceGetProcAddress") == 0) {
+        real_NvnDeviceGetProcAddress = (void* (*)(void*, const char*))r;
+        g_nvn_gpa_logs = 0;
+        nupLogf("  [trace] proxying nvnDeviceGetProcAddress for runtime NVN tracing\n");
+        return (void*)hook_NvnDeviceGetProcAddress;
+    }
     return r;
 }
 
@@ -2592,6 +2618,15 @@ u32 hooksLookupNextForCompat(uintptr_t* out_addr, const char* sym_name) {
         nupLogf("[compat] LookupNextSymbolForCompat('%s') -> NOT FOUND\n", sym_name);
         *out_addr = 0;
         return MAKERESULT(22, 5); // 0xa16
+    }
+    if (nupTraceIsEnabled()) {
+        nupLogBufferedf("[compat_next] '%s' -> 0x%llx%s\n", sym_name,
+                        (unsigned long long)addr, hooked ? " [hooked]" : "");
+        if (!hooked) {
+            const u64 tramp = nupTraceWrapPlt("compat_next", sym_name, addr);
+            if (tramp)
+                addr = tramp;
+        }
     }
     *out_addr = (uintptr_t)addr;
     return 0;

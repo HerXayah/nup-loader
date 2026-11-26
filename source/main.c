@@ -307,9 +307,37 @@ void nupRecordWorkerThreadName(void* thread_type, const char* name) {
 
 static void heartbeat_thread_fn(void* arg) {
     (void)arg;
-    for (u32 t = 1; t <= 12; t++) {
+    u32 elapsed_ms = 0;
+    if (nupTraceIsEnabled()) {
+        // Early-boot checkpoint drain (every 100ms for the first 2s) so even raw
+        // hardware faults that skip user exception handlers leave persisted traces.
+        for (u32 step = 1; step <= 20; step++) {
+            svcSleepThread(100000000ULL);
+            elapsed_ms = step * 100u;
+            nupTracePollHeartbeat(elapsed_ms, true);
+            nupLogFlush();
+            if ((step % 10u) == 0u) {
+                u64 used = 0, sys_used = 0, sys_tot = 0, ns_used = 0, ns_tot = 0;
+                Result urc = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+                svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+                svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+                svcGetInfo(&ns_used, InfoType_UsedNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
+                svcGetInfo(&ns_tot, InfoType_TotalNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
+                nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u tr_seq=%llu drop=%llu\n",
+                        elapsed_ms / 1000u, (unsigned long long)used, urc,
+                        (unsigned long long)ns_used, (unsigned long long)ns_tot,
+                        (unsigned long long)sys_used, (unsigned long long)sys_tot,
+                        g_open_file_count, g_worker_count, g_bad_reent_count,
+                        (unsigned long long)nupTraceTotalSeq(),
+                        (unsigned long long)nupTraceDroppedCount());
+            }
+        }
+    }
+    const u32 start_sec = nupTraceIsEnabled() ? 3u : 1u;
+    for (u32 t = start_sec; t <= 12; t++) {
         svcSleepThread(1000000000ULL);
-        nupTracePollHeartbeat(t);
+        elapsed_ms = t * 1000u;
+        nupTracePollHeartbeat(elapsed_ms, false);
         nupLogFlush();
         u64 used = 0, sys_used = 0, sys_tot = 0, ns_used = 0, ns_tot = 0;
         Result urc = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
@@ -318,12 +346,13 @@ static void heartbeat_thread_fn(void* arg) {
         svcGetInfo(&ns_used, InfoType_UsedNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&ns_tot, InfoType_TotalNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
         if (nupTraceIsEnabled()) {
-            nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u tr_seq=%u\n",
+            nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u tr_seq=%llu drop=%llu\n",
                     t, (unsigned long long)used, urc,
                     (unsigned long long)ns_used, (unsigned long long)ns_tot,
                     (unsigned long long)sys_used, (unsigned long long)sys_tot,
                     g_open_file_count, g_worker_count, g_bad_reent_count,
-                    nupTraceTotalSeq());
+                    (unsigned long long)nupTraceTotalSeq(),
+                    (unsigned long long)nupTraceDroppedCount());
         } else {
             nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u\n",
                     t, (unsigned long long)used, urc,
@@ -336,7 +365,7 @@ static void heartbeat_thread_fn(void* arg) {
     for (;;) {
         svcSleepThread(2000000000ULL);
         sec += 2;
-        nupTracePollHeartbeat(sec);
+        nupTracePollHeartbeat(sec * 1000u, false);
         nupLogFlush();
     }
 }
@@ -668,32 +697,84 @@ static void dump_latest_erpt(Handle hen_sm) {
     serviceClose(&r);
 }
 
+static void log_target_npdm_vs_donor(NupArchive* nup, const NupFileInfo* exefs,
+                                     u32 exefs_count, u64 target_tid) {
+    u64 donor_pid = 0, donor_used = 0, donor_tot = 0, donor_sys_used = 0, donor_sys_tot = 0;
+    svcGetInfo(&donor_pid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&donor_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&donor_tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&donor_sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&donor_sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+
+    nupLogBufferedf("\n--- HOST DONOR ENVIRONMENT (current donor process, not target runtime) ---\n");
+    nupLogBufferedf("  Donor ProgramId:         %016llx (%s)\n",
+                    (unsigned long long)donor_pid,
+                    (donor_pid >> 56) == 0x01 ? "Switch 1 donor" : "Switch 2 donor");
+    nupLogBufferedf("  Donor Memory:            used=0x%llx / total=0x%llx\n",
+                    (unsigned long long)donor_used, (unsigned long long)donor_tot);
+    nupLogBufferedf("  Donor SystemResource:    used=0x%llx / total=0x%llx (expected VAM=%s)\n",
+                    (unsigned long long)donor_sys_used, (unsigned long long)donor_sys_tot,
+                    donor_sys_tot > 0 ? "ENABLED" : "DISABLED");
+
+    const NupFileInfo* npdm_fi = NULL;
+    for (u32 i = 0; i < exefs_count; i++) {
+        if (strcmp(exefs[i].name, "main.npdm") == 0) {
+            npdm_fi = &exefs[i];
+            break;
+        }
+    }
+    if (!npdm_fi) {
+        nupLogBufferedf("  Target main.npdm:        NOT FOUND in ExeFS\n");
+        return;
+    }
+    u8 meta[0x80];
+    memset(meta, 0, sizeof(meta));
+    const size_t rlen = npdm_fi->size < sizeof(meta) ? (size_t)npdm_fi->size : sizeof(meta);
+    if (R_FAILED(nupReadExefs(nup, npdm_fi, 0, meta, rlen)) || rlen < 0x30 || memcmp(meta, "META", 4) != 0) {
+        nupLogBufferedf("  Target main.npdm:        unreadable or non-META header (size=%llu)\n",
+                        (unsigned long long)npdm_fi->size);
+        return;
+    }
+    const u8 flags = meta[0x0c];
+    const u8 prio = meta[0x0e];
+    const u8 core = meta[0x0f];
+    u32 sysres_req = 0, stack_req = 0;
+    memcpy(&sysres_req, meta + 0x14, 4);
+    memcpy(&stack_req, meta + 0x1c, 4);
+    char proc_name[17];
+    memcpy(proc_name, meta + 0x20, 16);
+    proc_name[16] = '\0';
+
+    nupLogBufferedf("  Target main.npdm:        name='%s' flags=0x%02x (64bit=%d, addrspace=%u) prio=%u core=%u\n",
+                    proc_name, flags, (flags & 1) ? 1 : 0, (flags >> 1) & 7, prio, core);
+    nupLogBufferedf("  Target NPDM SysResource: 0x%x (%u MiB)  MainStack: 0x%x\n",
+                    sysres_req, sysres_req / (1024u * 1024u), stack_req);
+    if (sysres_req > 0 && donor_sys_tot == 0) {
+        nupLogBufferedf("  [!] VAM WARNING: target NPDM requests SystemResourceSize=0x%x, but current donor has 0!\n",
+                        sysres_req);
+    } else if (sysres_req > donor_sys_tot) {
+        nupLogBufferedf("  [!] SYSRES NOTE: target requests 0x%x > donor's 0x%llx\n",
+                        sysres_req, (unsigned long long)donor_sys_tot);
+    }
+    if ((target_tid >> 56) == 0x01 && (donor_pid >> 56) != 0x01) {
+        nupLogBufferedf("  [!] COMPAT WARNING: Switch 1 target (%016llx) on non-Switch-1 donor (%016llx) lacks CompatibilityPack!\n",
+                        (unsigned long long)target_tid, (unsigned long long)donor_pid);
+    }
+}
+
 static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_status_sz) {
     consoleClear();
     printf("  Static Audit: %s\n", entry->label);
     printf("  Title ID: %016llx\n\n", (unsigned long long)entry->title_id);
     consoleUpdate(NULL);
 
-    char audit_path[0x100];
-    snprintf(audit_path, sizeof(audit_path), "/kaihen/nup-audit-%016llx.txt",
+    char audit_path[0x80];
+    snprintf(audit_path, sizeof(audit_path), "/kaihen/audits/%016llx.txt",
              (unsigned long long)entry->title_id);
     nupLogInit(&g_sd, audit_path);
-    nupLogf("=== nup-loader [build=0325-trace1] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
+    nupLogf("=== nup-loader [build=0325-trace2] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
             entry->path, (unsigned long long)entry->title_id,
             entry->is_raw ? "RAW" : "NUP");
-
-    {
-        u64 pid = 0, used = 0, tot = 0, sys_used = 0, sys_tot = 0;
-        svcGetInfo(&pid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
-        nupLogf("[host] pid=%016llx mem=0x%llx/0x%llx sysres=0x%llx/0x%llx\n",
-                (unsigned long long)pid,
-                (unsigned long long)used, (unsigned long long)tot,
-                (unsigned long long)sys_used, (unsigned long long)sys_tot);
-    }
 
     NupFileInfo exefs[NUP_MAX_EXEFS_FILES];
     u32 exefs_count = 0;
@@ -722,6 +803,9 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
         return rc;
     }
 
+    const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
+    log_target_npdm_vs_donor(&g_nup, exefs, exefs_count, sel_tid);
+
     ModuleSet audit_mods = {};
     rc = elfLoadNupModulesForAudit(&audit_mods, &g_nup, exefs, exefs_count);
     if (R_FAILED(rc)) {
@@ -732,7 +816,6 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
         return rc;
     }
 
-    const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
     elfAttachSwitch1Compat(&audit_mods, sel_tid);
     printf("  Auditing %u modules...\n", audit_mods.count);
     consoleUpdate(NULL);
@@ -745,10 +828,10 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     nupLogClose();
 
     snprintf(out_status, out_status_sz,
-             "Audit -> %s (mods=%u entry=%s unres=%u hooked=%u unhook_fs=%u sys=%u)",
+             "Audit -> %s (m=%u %s unres=%u hook=%u fs=%u tr=%u/%u)",
              audit_path, sum.module_count, sum.entry_kind,
-             sum.unresolved_count, sum.hooked_count,
-             sum.unhooked_fs_aoc, sum.unhooked_sys);
+             sum.unresolved_count, sum.hooked_count, sum.unhooked_fs_aoc,
+             sum.trace_need_tramp, NUP_TRACE_MAX_SLOTS);
     return 0;
 }
 
@@ -757,8 +840,16 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     g_sdk_ex_registered = false;
     g_worker_count = 0;
     nupTraceReset(trace_mode);
-    nupLogInit(&g_sd, "/kaihen/nup-loader.log");
-    nupLogf("=== nup-loader [build=0325-trace1] (%s%s): %s (tid=%016llx) ===\n",
+
+    char log_path[0x80];
+    if (trace_mode) {
+        snprintf(log_path, sizeof(log_path), "/kaihen/traces/%016llx.log",
+                 (unsigned long long)entry->title_id);
+    } else {
+        snprintf(log_path, sizeof(log_path), "/kaihen/nup-loader.log");
+    }
+    nupLogInit(&g_sd, log_path);
+    nupLogf("=== nup-loader [build=0325-trace2] (%s%s): %s (tid=%016llx) ===\n",
             headless ? "headless" : "ui",
             trace_mode ? "+TRACE" : "",
             entry->path, (unsigned long long)entry->title_id);
@@ -767,7 +858,7 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         consoleClear();
         printf("  %s %s\n", trace_mode ? "TRACE Launching" : "Launching", entry->label);
         printf("  Title ID: %016llx\n", (unsigned long long)entry->title_id);
-        printf("  Log: /kaihen/nup-loader.log\n\n");
+        printf("  Log: %s\n\n", log_path);
         consoleUpdate(NULL);
     }
 
@@ -842,7 +933,8 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
     elfAttachSwitch1Compat(&g_mods, sel_tid);
     if (trace_mode) {
-        if (!headless) { printf("  [4/6] Running static hook/symbol audit...\n"); consoleUpdate(NULL); }
+        if (!headless) { printf("  [4/6] Running static NPDM + hook/capacity audit...\n"); consoleUpdate(NULL); }
+        log_target_npdm_vs_donor(&g_nup, exefs, exefs_count, sel_tid);
         elfRunStaticAudit(&g_mods, hooksResolve, NULL);
     }
     if (!headless) { printf("  [4/6] Relocating %u modules & hooking nn::fs / nn::sm...\n", g_mods.count); consoleUpdate(NULL); }

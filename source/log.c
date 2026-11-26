@@ -103,6 +103,21 @@ void nupLogInit(FsFileSystem* sd, const char* path) {
     if (!sd || !path)
         return;
     fsFsCreateDirectory(sd, "/kaihen");
+    // Ensure any parent subdirectories (e.g. /kaihen/audits, /kaihen/traces) exist
+    {
+        char dir[FS_MAX_PATH];
+        size_t plen = strlen(path);
+        if (plen >= sizeof(dir)) plen = sizeof(dir) - 1;
+        memcpy(dir, path, plen);
+        dir[plen] = '\0';
+        for (size_t i = 1; i < plen; i++) {
+            if (dir[i] == '/') {
+                dir[i] = '\0';
+                fsFsCreateDirectory(sd, dir);
+                dir[i] = '/';
+            }
+        }
+    }
     fsFsDeleteFile(sd, path);
     if (R_FAILED(fsFsCreateFile(sd, path, 0, 0)))
         return;

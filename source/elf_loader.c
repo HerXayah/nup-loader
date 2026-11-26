@@ -771,7 +771,9 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
                         was_hooked = true;
                     }
                 }
-                if (type == R_AARCH64_JUMP_SLOT && !was_hooked && addr &&
+                const bool is_func_reloc = (type == R_AARCH64_JUMP_SLOT) ||
+                    (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2 /* STT_FUNC */);
+                if (is_func_reloc && !was_hooked && addr &&
                     nupTraceIsEnabled() && strcmp(mod->name, "sdk") != 0) {
                     const u64 tramp = nupTraceWrapPlt(mod->name, name, addr);
                     if (tramp)
@@ -964,8 +966,11 @@ Result elfRelocateAll(ModuleSet* set, SymbolHookFn hook_fn, u32* out_unresolved)
     if ((p = (void**)(uintptr_t)elfFindSymbol(set, "_ZN2nn2ro6detail14g_pRoDebugFlagE"))) *p = &g_ro_debug_flag;
     if (nupTraceIsEnabled()) {
         nupTraceSetModules(set);
-        nupLogf("[trace] PLT tracer armed: %u / %u trampoline slots used\n",
-                nupTraceSlotCount(), NUP_TRACE_MAX_SLOTS);
+        const u32 used = nupTraceSlotCount();
+        const u32 ovf = nupTraceOverflowCount();
+        nupLogf("[trace] PLT/GLOB_DAT tracer armed: %u / %u trampoline slots used (overflow=%u)%s\n",
+                used, NUP_TRACE_MAX_SLOTS, ovf,
+                ovf ? " [WARNING: CAPACITY EXCEEDED]" : "");
     }
     if (out_unresolved)
         *out_unresolved = unresolved;
@@ -1093,11 +1098,30 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
     nupLogBufferedf("\n--- MODULES (%u, compat=%d) ---\n", set->count, set->has_compat ? 1 : 0);
     for (u32 m = 0; m < set->count; m++) {
         const LoadedModule* mod = &set->mods[m];
-        nupLogBufferedf("  %-8s size=0x%llx syms=%u rela=%llu jmprel=%llu init_arr=%llu%s\n",
+        const u32 first_word = mod->nso_base ? *(const u32*)(uintptr_t)mod->nso_base : 0;
+        const bool is_m20 = (first_word == 1 && mod->module_object_off);
+        if (is_m20) sum.has_modobj20 = true;
+        sum.total_jmprel += (u32)(mod->pltrelsz / sizeof(Elf64_Rela));
+        // Count GLOB_DAT & TLSDESC in RELA
+        u32 mod_gdat = 0, mod_tls = 0;
+        if (mod->rela && mod->relasz) {
+            const Elf64_Rela* r = (const Elf64_Rela*)mod->rela;
+            const u64 rc = mod->relasz / sizeof(Elf64_Rela);
+            for (u64 i = 0; i < rc; i++) {
+                const u32 rt = ELF64_R_TYPE(r[i].r_info);
+                if (rt == R_AARCH64_GLOB_DAT) mod_gdat++;
+                else if (rt == R_AARCH64_TLSDESC) mod_tls++;
+            }
+        }
+        sum.total_glob_dat += mod_gdat;
+        sum.total_tlsdesc += mod_tls;
+        nupLogBufferedf("  %-8s size=0x%llx syms=%u rela=%llu gdat=%u tls=%u jmprel=%llu init_arr=%llu modobj=%s%s\n",
                         mod->name, (unsigned long long)mod->total_size, mod->sym_count,
                         (unsigned long long)(mod->relasz / sizeof(Elf64_Rela)),
+                        mod_gdat, mod_tls,
                         (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
                         (unsigned long long)(mod->init_arraysz / sizeof(u64)),
+                        is_m20 ? "ModObj20" : (mod->module_object_off ? "oss-rtld" : "none"),
                         mod->is_compat ? " [COMPAT]" : "");
     }
 
@@ -1111,16 +1135,70 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
     const u64 reg_obs = elfFindSymbol(set, "_ZN2nn4diag21RegisterAbortObserverEPNS0_19AbortObserverHolderE");
     const u64 std_alloc2 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocator10InitializeEPvm");
     const u64 std_alloc3 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocator10InitializeEPvmb");
+    const u64 rtld_auto = elfFindSymbol(set, "_ZN2nn2ro6detail15g_pAutoLoadListE");
+    const u64 nvn_boot = elfFindSymbol(set, "nvnBootstrapLoader");
     snprintf(sum.entry_kind, sizeof(sum.entry_kind), "%s",
              start5 ? "5arg" : (start4 ? "4arg" : "manual"));
 
-    nupLogBufferedf("\n--- ENTRY & RUNTIME SYMBOLS (entry=%s) ---\n", sum.entry_kind);
+    nupLogBufferedf("\n--- ENTRY & STARTUP COMPATIBILITY (entry=%s, ModObj20=%d, TLSDESC=%u) ---\n",
+                    sum.entry_kind, sum.has_modobj20 ? 1 : 0, sum.total_tlsdesc);
     nupLogBufferedf("  nn::init::Start(5arg)=%d  (4arg)=%d  nninitStartup=%d  nnMain=%d\n",
                     start5 ? 1 : 0, start4 ? 1 : 0, startup ? 1 : 0, main_sym ? 1 : 0);
     nupLogBufferedf("  nninitInitializeSdkModule=%d  nnosInitialize=%d  SetUserExceptionHandler=%d  AbortObserver=%d\n",
                     init_sdk ? 1 : 0, os_init ? 1 : 0, set_ex ? 1 : 0, reg_obs ? 1 : 0);
-    nupLogBufferedf("  StandardAllocator::Initialize(2arg)=%d  (3arg)=%d\n",
-                    std_alloc2 ? 1 : 0, std_alloc3 ? 1 : 0);
+    nupLogBufferedf("  StandardAllocator::Initialize(2arg)=%d  (3arg)=%d  rtld_AutoLoadList=%d  nvnBootstrapLoader=%d\n",
+                    std_alloc2 ? 1 : 0, std_alloc3 ? 1 : 0, rtld_auto ? 1 : 0, nvn_boot ? 1 : 0);
+
+    // Compute exact PLT/GLOB_DAT trace capacity using the exact shared nupTraceShouldWrap predicate
+    {
+        u32 sel_total = 0, sel_hooked = 0, sel_need = 0;
+        for (u32 m = 0; m < set->count; m++) {
+            const LoadedModule* mod = &set->mods[m];
+            if (strcmp(mod->name, "sdk") == 0 || !mod->symtab || !mod->strtab)
+                continue;
+            const size_t bits_sz = ((size_t)mod->sym_count + 7u) / 8u;
+            u8* seen = bits_sz ? (u8*)calloc(1, bits_sz) : NULL;
+            const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
+            const Elf64_Rela* tables[2] = { (const Elf64_Rela*)mod->jmprel, (const Elf64_Rela*)mod->rela };
+            const u64 sizes[2] = { mod->pltrelsz, mod->relasz };
+            for (int t = 0; t < 2; t++) {
+                if (!tables[t] || !sizes[t]) continue;
+                const u64 cnt = sizes[t] / sizeof(Elf64_Rela);
+                for (u64 i = 0; i < cnt; i++) {
+                    const u32 rt = ELF64_R_TYPE(tables[t][i].r_info);
+                    const u32 sidx = ELF64_R_SYM(tables[t][i].r_info);
+                    if (sidx >= mod->sym_count) continue;
+                    const Elf64_Sym* sym = &syms[sidx];
+                    const bool is_fn = (rt == R_AARCH64_JUMP_SLOT) ||
+                        (rt == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
+                    if (!is_fn) continue;
+                    if (seen && (seen[sidx >> 3] & (1u << (sidx & 7)))) continue;
+                    if (seen) seen[sidx >> 3] |= (u8)(1u << (sidx & 7));
+                    const char* name = (sym->st_name < mod->strsz) ? (mod->strtab + sym->st_name) : "";
+                    if (!nupTraceShouldWrap(mod->name, name)) continue;
+                    sel_total++;
+                    if (hook_fn && hook_fn(name, 0) != 0) sel_hooked++;
+                    else if (audit_resolve_sym(set, mod, sym, name) != 0) sel_need++;
+                }
+            }
+            free(seen);
+        }
+        sum.trace_selected = sel_total;
+        sum.trace_need_tramp = sel_need;
+        nupLogBufferedf("\n--- PLT TRACE CAPACITY ---\n");
+        nupLogBufferedf("  Total JUMP_SLOT relocations:  %u (GLOB_DAT: %u)\n",
+                        sum.total_jmprel, sum.total_glob_dat);
+        nupLogBufferedf("  Selected imports (per-mod):   %u\n", sel_total);
+        nupLogBufferedf("  Already hooked:               %u\n", sel_hooked);
+        nupLogBufferedf("  Need trampolines (upper bnd): %u\n", sel_need);
+        nupLogBufferedf("  Available trampolines:        %u\n", NUP_TRACE_MAX_SLOTS);
+        if (sel_need <= NUP_TRACE_MAX_SLOTS)
+            nupLogBufferedf("  Capacity:                     OK\n");
+        else
+            nupLogBufferedf("  Capacity:                     EXCEEDED by %u (dedup may reduce)\n",
+                            sel_need - NUP_TRACE_MAX_SLOTS);
+        nupLogBufferedf("  Coverage: JUMP_SLOT=Yes | GLOB_DAT(func)=Yes | nvnDeviceGetProcAddress=Proxy | intra-module/SVC=No\n");
+    }
 
     static const char* const pass_titles[4] = {
         "UNRESOLVED NON-WEAK SYMBOLS (ALL)",
