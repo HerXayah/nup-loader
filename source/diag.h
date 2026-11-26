@@ -21,3 +21,4 @@ void nupOnBeforeNnMain(void);
 void nupRecordWorkerThread(void* thread_type, void* fn);
 void nupRecordWorkerThreadName(void* thread_type, const char* name);
 void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1);
+void nupDiagDumpAbortContext(u64 caller);

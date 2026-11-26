@@ -1361,12 +1361,11 @@ const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off) {
             const u64 a = mod->nso_base + s[i].st_value;
             if (a > addr)
                 continue;
-            // Allow addr == a + st_size because LR after a noreturn tail call sits right at the end.
-            if ((!s[i].st_size || addr <= a + s[i].st_size) && a >= exact_v) {
+            if ((!s[i].st_size || addr < a + s[i].st_size) && a >= exact_v) {
                 exact_v = a;
                 exact = mod->strtab + s[i].st_name;
             }
-            if (a >= near_v && (addr - a) < 0x10000ULL) {
+            if (a >= near_v && (addr - a) < 0x1000ULL) {
                 near_v = a;
                 near = mod->strtab + s[i].st_name;
             }

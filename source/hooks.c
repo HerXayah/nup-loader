@@ -165,6 +165,7 @@ static void (*real_AbortImpl0)(void) = NULL;
 static void (*real_AbortImplRes)(const u32*) = NULL;
 static void (*real_AbortRes)(const u32*) = NULL;
 static void (*real_VAbortImpl)(const char*, const char*, const char*, int, const u32*, const void*, const char*, void*) = NULL;
+static void (*real_StdAbort)(void) = NULL;
 static void (*real_StdTerminate)(void) = NULL;
 static void (*real_AssertFail)(const char*, const char*, int, const char*) = NULL;
 static void (*real_LibcppVerboseAbort)(const char*, ...) = NULL;
@@ -2795,6 +2796,13 @@ static void hook_VAbortImpl(const char* expr, const char* func, const char* file
     if (real_VAbortImpl) real_VAbortImpl(expr, func, file, line, res, exc, fmt, ap_ptr);
 }
 
+static void hook_StdAbort(void) {
+    const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
+    nupDiagDumpAbortContext(caller);
+    nupLogBacktrace("abort()", caller, 0, 0);
+    if (real_StdAbort) real_StdAbort();
+}
+
 static void hook_StdTerminate(void) {
     const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
     nupLogBacktrace("std::terminate()", caller, 0, 0);
@@ -2983,6 +2991,7 @@ static const HookProviderEntry g_hook_registry[] = {
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", hook_AbortImplRes, real_AbortImplRes, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn4diag6detail5AbortEPKNS_6ResultE", hook_AbortRes, real_AbortRes, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn4diag6detail10VAbortImplEPKcS3_S3_iPKNS_6ResultEPKNS_2os17UserExceptionInfoES3_RSt9__va_list", hook_VAbortImpl, real_VAbortImpl, HOOK_PROV_SVC, false),
+    PROV_WRAP("abort", hook_StdAbort, real_StdAbort, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZSt9terminatev", hook_StdTerminate, real_StdTerminate, HOOK_PROV_SVC, false),
     PROV_WRAP("__assert_fail", hook_AssertFail, real_AssertFail, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZNSt3__122__libcpp_verbose_abortEPKcz", hook_LibcppVerboseAbort, real_LibcppVerboseAbort, HOOK_PROV_SVC, false),

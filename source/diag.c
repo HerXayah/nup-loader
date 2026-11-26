@@ -157,9 +157,9 @@ static void on_sdk_user_exception(void* info) {
         char bt_s[64];
         nupFmtAddrMod(ret_lr, bt_s, sizeof(bt_s));
         u64 soff = 0;
-        const char* sym = elfAddrToSymbol(&g_mods, ret_lr, &soff);
+        const char* sym = elfAddrToSymbol(&g_mods, ret_lr >= 4 ? ret_lr - 4 : ret_lr, &soff);
         if (sym)
-            nupLogf("  ex_bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)ret_lr, bt_s, sym, (unsigned long long)soff);
+            nupLogf("  ex_bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)ret_lr, bt_s, sym, (unsigned long long)(soff + 4));
         else
             nupLogf("  ex_bt[%d] %016llx (%s)\n", i, (unsigned long long)ret_lr, bt_s);
         if (!next_fp || next_fp <= fp_addr || (next_fp - fp_addr) > 0x100000ULL) break;
@@ -213,9 +213,9 @@ static void dump_abort_info(const char* tag, const void* info) {
         char bt_s[64];
         nupFmtAddrMod(lr, bt_s, sizeof(bt_s));
         u64 sym_off = 0;
-        const char* sym = elfAddrToSymbol(&g_mods, lr, &sym_off);
+        const char* sym = elfAddrToSymbol(&g_mods, lr >= 4 ? lr - 4 : lr, &sym_off);
         if (sym)
-            nupLogf("  bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)lr, bt_s, sym, (unsigned long long)sym_off);
+            nupLogf("  bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)lr, bt_s, sym, (unsigned long long)(sym_off + 4));
         else
             nupLogf("  bt[%d] %016llx (%s)\n", i, (unsigned long long)lr, bt_s);
         if (!nx || nx <= fp || (u64)(uintptr_t)nx - (u64)(uintptr_t)fp > 0x100000ULL)
@@ -231,10 +231,10 @@ void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
     char lr_s[64];
     nupFmtAddrMod(caller, lr_s, sizeof(lr_s));
     u64 lr_off = 0;
-    const char* lr_sym = elfAddrToSymbol(&g_mods, caller, &lr_off);
+    const char* lr_sym = elfAddrToSymbol(&g_mods, caller >= 4 ? caller - 4 : caller, &lr_off);
     nupLogf("!!! HOOKED %s tid=%llu caller=%s (%s+0x%llx) arg0=0x%llx arg1=0x%llx\n",
             tag, (unsigned long long)tid, lr_s, lr_sym ? lr_sym : "?",
-            (unsigned long long)lr_off, (unsigned long long)arg0, (unsigned long long)arg1);
+            (unsigned long long)(lr_sym ? lr_off + 4 : 0), (unsigned long long)arg0, (unsigned long long)arg1);
     u64* fp = (u64*)__builtin_frame_address(0);
     for (int i = 0; i < 20 && fp; i++) {
         if (!is_readable_addr((u64)(uintptr_t)fp, 16))
@@ -244,9 +244,9 @@ void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
         char bt_s[64];
         nupFmtAddrMod(lr, bt_s, sizeof(bt_s));
         u64 sym_off = 0;
-        const char* sym = elfAddrToSymbol(&g_mods, lr, &sym_off);
+        const char* sym = elfAddrToSymbol(&g_mods, lr >= 4 ? lr - 4 : lr, &sym_off);
         if (sym)
-            nupLogf("  bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)lr, bt_s, sym, (unsigned long long)sym_off);
+            nupLogf("  bt[%d] %016llx (%s) %s+0x%llx\n", i, (unsigned long long)lr, bt_s, sym, (unsigned long long)(sym_off + 4));
         else
             nupLogf("  bt[%d] %016llx (%s)\n", i, (unsigned long long)lr, bt_s);
         if (!nx || nx <= fp || (u64)(uintptr_t)nx - (u64)(uintptr_t)fp > 0x100000ULL)
@@ -254,6 +254,108 @@ void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
         fp = nx;
     }
     nupTraceDumpRecent(tag, 64);
+    nupLogFlush();
+}
+
+static bool is_printable_str_at(u64 addr, size_t min_len, size_t* out_len) {
+    if (!is_readable_addr(addr, min_len + 1))
+        return false;
+    const u8* p = (const u8*)(uintptr_t)addr;
+    size_t n = 0;
+    while (n < 160 && is_readable_addr(addr + n, 1)) {
+        const u8 c = p[n];
+        if (c == 0) break;
+        if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c < 0x7f)) {
+            n++;
+            continue;
+        }
+        return false;
+    }
+    if (n < min_len || !is_readable_addr(addr + n, 1) || p[n] != 0)
+        return false;
+    if (out_len) *out_len = n;
+    return true;
+}
+
+static bool is_in_module_rodata(u64 addr) {
+    for (u32 m = 0; m < g_mods.count; m++) {
+        const LoadedModule* mod = &g_mods.mods[m];
+        if (mod->rodata_size &&
+            addr >= mod->nso_base + mod->rodata_off &&
+            addr < mod->nso_base + mod->rodata_off + mod->rodata_size)
+            return true;
+    }
+    return false;
+}
+
+void nupDiagDumpAbortContext(u64 caller) {
+    caller = nupStripCodePac(caller);
+    // 1. Dump AArch64 instructions immediately preceding the abort call site
+    if (caller >= 0x40 && (caller & 3ULL) == 0 && is_readable_addr(caller - 0x40, 0x44)) {
+        const u32* ins = (const u32*)(uintptr_t)(caller - 0x40);
+        char cs[64];
+        nupFmtAddrMod(caller - 0x40, cs, sizeof(cs));
+        nupLogf("  [abort-code @ %s]:\n", cs);
+        for (int i = 0; i < 16; i += 4) {
+            nupLogf("    +%02x: %08x %08x %08x %08x\n",
+                    i * 4, ins[i], ins[i + 1], ins[i + 2], ins[i + 3]);
+        }
+    }
+    // 2. Scan aborting thread's stack for formatted messages / paths and rodata string pointers
+    const u64 fp = (u64)(uintptr_t)__builtin_frame_address(0);
+    if (!fp || (fp & 7ULL) != 0)
+        return;
+    // 2a. Stack pointers into module .rodata strings (first 0x600 bytes of stack)
+    u32 ptr_hits = 0;
+    u64 seen_ptrs[16] = {};
+    for (u64 off = 0; off < 0x600 && ptr_hits < 12; off += 8) {
+        if (!is_readable_addr(fp + off, 8))
+            break;
+        const u64 val = *(const u64*)(uintptr_t)(fp + off);
+        if (!is_in_module_rodata(val))
+            continue;
+        bool dup = false;
+        for (u32 k = 0; k < ptr_hits; k++)
+            if (seen_ptrs[k] == val) { dup = true; break; }
+        if (dup) continue;
+        size_t slen = 0;
+        if (is_printable_str_at(val, 4, &slen)) {
+            seen_ptrs[ptr_hits++] = val;
+            char rs[64];
+            nupFmtAddrMod(val, rs, sizeof(rs));
+            nupLogf("  [abort-rodata sp+0x%llx -> %s]: '%.120s'\n",
+                    (unsigned long long)off, rs, (const char*)(uintptr_t)val);
+        }
+    }
+    // 2b. Inline ASCII strings on the stack (up to 0x3000 bytes above fp, e.g. formatted 0x400 buffers)
+    u32 str_hits = 0;
+    for (u64 off = 0; off < 0x3000 && str_hits < 16; ) {
+        if (!is_readable_addr(fp + off, 16))
+            break;
+        const u8* p = (const u8*)(uintptr_t)(fp + off);
+        if (p[0] >= 0x20 && p[0] < 0x7f) {
+            size_t n = 0;
+            while (off + n < 0x3000 && n < 160 && is_readable_addr(fp + off + n, 1)) {
+                const u8 c = p[n];
+                if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c < 0x7f))
+                    n++;
+                else
+                    break;
+            }
+            if (n >= 8 && off + n < 0x3000 && is_readable_addr(fp + off + n, 1) && p[n] == 0) {
+                char clean[164];
+                size_t cp = n < 160 ? n : 160;
+                for (size_t j = 0; j < cp; j++)
+                    clean[j] = (p[j] == '\n' || p[j] == '\r' || p[j] == '\t') ? ' ' : (char)p[j];
+                clean[cp] = '\0';
+                nupLogf("  [abort-stack +0x%llx]: '%s'\n", (unsigned long long)off, clean);
+                str_hits++;
+                off += n + 1;
+                continue;
+            }
+        }
+        off++;
+    }
     nupLogFlush();
 }
 
