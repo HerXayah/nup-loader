@@ -315,11 +315,11 @@ void nupDiagDumpAbortContext(u64 caller) {
     nupLogf("  [abort-ctx tid=%llu] caller_pc=0x%llx tpidr_el0=0x%llx tpidrro_el0=0x%llx\n",
             (unsigned long long)tid, (unsigned long long)(caller >= 4 ? caller - 4 : caller),
             (unsigned long long)tpidr, (unsigned long long)tpidrro);
-    if (tpidr && (tpidr & 7ULL) == 0 && is_readable_addr(tpidr, 0xC0)) {
+    if (tpidr && (tpidr & 7ULL) == 0 && is_readable_addr(tpidr, 0x180)) {
         const u64* tp = (const u64*)(uintptr_t)tpidr;
-        nupLogf("  [abort-tls @ tpidr_el0=0x%llx (0x00..0xc0)]:\n", (unsigned long long)tpidr);
-        for (u32 i = 0; i < 24; i += 4) {
-            nupLogf("    +%02x: %016llx %016llx %016llx %016llx\n",
+        nupLogf("  [abort-tls @ tpidr_el0=0x%llx (0x00..0x180)]:\n", (unsigned long long)tpidr);
+        for (u32 i = 0; i < 48; i += 4) {
+            nupLogf("    +%03x: %016llx %016llx %016llx %016llx\n",
                     i * 8,
                     (unsigned long long)tp[i], (unsigned long long)tp[i + 1],
                     (unsigned long long)tp[i + 2], (unsigned long long)tp[i + 3]);
@@ -396,7 +396,8 @@ void nupDiagDumpAbortContext(u64 caller) {
                 }
             }
         }
-        // Dump up to 48 instructions of each unique internal BL target before abort()
+        // Dump up to 48 instructions of each unique internal BL target before abort(),
+        // and generically inspect any singleton object loaded via ADRP + LDR X0, [Xn, #imm]
         for (u32 b = 0; b < internal_bl_count; b++) {
             const u64 tgt = internal_bls[b];
             if (!tgt || (tgt & 3ULL) != 0 || !is_readable_addr(tgt, 0xC0))
@@ -408,6 +409,64 @@ void nupDiagDumpAbortContext(u64 caller) {
             for (u32 i = 0; i < 48; i += 4) {
                 nupLogf("    +%02x: %08x %08x %08x %08x\n",
                         i * 4, cal[i], cal[i + 1], cal[i + 2], cal[i + 3]);
+            }
+            u64 c_adrp[32] = {};
+            bool c_valid[32] = {};
+            bool inspected_obj = false;
+            for (u32 i = 0; i < 24 && !inspected_obj; i++) {
+                const u32 w = cal[i];
+                const u64 pc = tgt + (u64)i * 4ULL;
+                if (w == 0xD65F03C0u) break; // RET
+                if ((w & 0x9F000000u) == 0x90000000u) {
+                    const u32 rd = w & 31u;
+                    s64 immhi = (s64)(s32)(w << 8) >> 13;
+                    u64 immlo = (w >> 29) & 3u;
+                    c_adrp[rd] = (pc & ~0xFFFULL) + (u64)(((immhi << 2) | (s64)immlo) << 12);
+                    c_valid[rd] = true;
+                } else if ((w & 0xFFC0001Fu) == 0xF9400000u) {
+                    // LDR X0, [Xn, #imm12*8]
+                    const u32 rn = (w >> 5) & 31u;
+                    const u64 off = (u64)((w >> 10) & 0xFFFu) * 8ULL;
+                    if (c_valid[rn]) {
+                        const u64 slot = c_adrp[rn] + off;
+                        if ((slot & 7ULL) == 0 && is_readable_addr(slot, 8)) {
+                            const u64 obj = *(const u64*)(uintptr_t)slot;
+                            char ss[64];
+                            nupFmtAddrMod(slot, ss, sizeof(ss));
+                            nupLogf("  [abort-obj #%u slot=%s -> obj=0x%llx]\n",
+                                    b, ss, (unsigned long long)obj);
+                            if (obj && (obj & 7ULL) == 0 && is_readable_addr(obj, 0x80)) {
+                                const u64* oq = (const u64*)(uintptr_t)obj;
+                                for (u32 k = 0; k < 16; k += 4) {
+                                    nupLogf("    obj+%02x: %016llx %016llx %016llx %016llx\n",
+                                            k * 8,
+                                            (unsigned long long)oq[k], (unsigned long long)oq[k + 1],
+                                            (unsigned long long)oq[k + 2], (unsigned long long)oq[k + 3]);
+                                }
+                                const u64 vt = nupStripCodePac(oq[0]);
+                                if (vt && (vt & 7ULL) == 0 && is_readable_addr(vt, 0x30)) {
+                                    const u64* vq = (const u64*)(uintptr_t)vt;
+                                    char vts[64], f2s[64];
+                                    const u64 fn2 = nupStripCodePac(vq[2]);
+                                    nupFmtAddrMod(vt, vts, sizeof(vts));
+                                    nupFmtAddrMod(fn2, f2s, sizeof(f2s));
+                                    nupLogf("    vtable=%s [0]=0x%llx [1]=0x%llx [2]=%s [3]=0x%llx\n",
+                                            vts, (unsigned long long)vq[0], (unsigned long long)vq[1],
+                                            f2s, (unsigned long long)vq[3]);
+                                    if (fn2 && (fn2 & 3ULL) == 0 && is_readable_addr(fn2, 0x80)) {
+                                        const u32* fi = (const u32*)(uintptr_t)fn2;
+                                        nupLogf("    [vtable[2] @ %s (32 insns)]:\n", f2s);
+                                        for (u32 k = 0; k < 32; k += 4) {
+                                            nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                                    k * 4, fi[k], fi[k + 1], fi[k + 2], fi[k + 3]);
+                                        }
+                                    }
+                                }
+                            }
+                            inspected_obj = true;
+                        }
+                    }
+                }
             }
         }
     }
