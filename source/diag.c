@@ -312,9 +312,12 @@ void nupDiagDumpAbortContext(u64 caller) {
     svcGetThreadId(&tid, CUR_THREAD_HANDLE);
     __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
     __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tpidrro));
-    nupLogf("  [abort-ctx tid=%llu] caller_pc=0x%llx tpidr_el0=0x%llx tpidrro_el0=0x%llx\n",
+    const u64 tlr_1f0 = (tpidrro && is_readable_addr(tpidrro + 0x1f0, 16)) ? *(const u64*)(uintptr_t)(tpidrro + 0x1f0) : 0;
+    const u64 tlr_1f8 = (tpidrro && is_readable_addr(tpidrro + 0x1f0, 16)) ? *(const u64*)(uintptr_t)(tpidrro + 0x1f8) : 0;
+    nupLogf("  [abort-ctx tid=%llu] caller_pc=0x%llx tpidr_el0=0x%llx tpidrro_el0=0x%llx tlr[1f0]=0x%llx tlr[1f8]=0x%llx\n",
             (unsigned long long)tid, (unsigned long long)(caller >= 4 ? caller - 4 : caller),
-            (unsigned long long)tpidr, (unsigned long long)tpidrro);
+            (unsigned long long)tpidr, (unsigned long long)tpidrro,
+            (unsigned long long)tlr_1f0, (unsigned long long)tlr_1f8);
     if (tpidr && (tpidr & 7ULL) == 0 && is_readable_addr(tpidr, 0x180)) {
         const u64* tp = (const u64*)(uintptr_t)tpidr;
         nupLogf("  [abort-tls @ tpidr_el0=0x%llx (0x00..0x180)]:\n", (unsigned long long)tpidr);
@@ -752,10 +755,14 @@ void nupDiagDumpAbortContext(u64 caller) {
                     const u64 hit_pc = mod->nso_base + (u64)i * 4ULL;
                     char hs[64];
                     nupFmtAddrMod(hit_pc, hs, sizeof(hs));
-                    nupLogf("  [msr-tpidr #%u @ %s (reg=x%u)]:\n",
-                            hits, hs, text[i] & 31u);
-                    const u32 lo = (i >= 12) ? (i - 12) : 0;
-                    const u32 hi = (i + 8 <= nwords) ? (i + 8) : nwords;
+                    u64 sym_off = 0;
+                    const char* sym = elfAddrToSymbol(&g_mods, hit_pc, &sym_off);
+                    nupLogf("  [msr-tpidr #%u @ %s (%s+0x%llx) (reg=x%u)]:\n",
+                            hits, hs, sym ? sym : "?", (unsigned long long)sym_off, text[i] & 31u);
+                    const u32 back = (hits == 0) ? 128u : (hits == 1 ? 80u : 12u);
+                    const u32 fwd = (hits == 1) ? 20u : 8u;
+                    const u32 lo = (i >= back) ? (i - back) : 0;
+                    const u32 hi = (i + fwd <= nwords) ? (i + fwd) : nwords;
                     for (u32 k = lo; k < hi; k += 4) {
                         u32 w0 = text[k];
                         u32 w1 = (k + 1 < hi) ? text[k + 1] : 0;
@@ -927,8 +934,20 @@ void nupOnBeforeNnMain(void) {
     u64 tpidr = 0, tpidrro = 0;
     __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tpidr));
     __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tpidrro));
-    nupLogf("[6/6] before nnMain: main tpidr_el0=0x%llx tpidrro_el0=0x%llx\n",
-            (unsigned long long)tpidr, (unsigned long long)tpidrro);
+    const u64 tlr_1f0 = (tpidrro && is_readable_addr(tpidrro + 0x1f0, 16)) ? *(const u64*)(uintptr_t)(tpidrro + 0x1f0) : 0;
+    const u64 tlr_1f8 = (tpidrro && is_readable_addr(tpidrro + 0x1f0, 16)) ? *(const u64*)(uintptr_t)(tpidrro + 0x1f8) : 0;
+    nupLogf("[6/6] before nnMain: main tpidr_el0=0x%llx tpidrro_el0=0x%llx tlr[1f0]=0x%llx tlr[1f8]=0x%llx\n",
+            (unsigned long long)tpidr, (unsigned long long)tpidrro,
+            (unsigned long long)tlr_1f0, (unsigned long long)tlr_1f8);
+    if (tpidr && (tpidr & 7ULL) == 0 && is_readable_addr(tpidr, 0xC0)) {
+        const u64* tp = (const u64*)(uintptr_t)tpidr;
+        for (u32 i = 0; i < 24; i += 4) {
+            nupLogf("  [main-tls +%02x]: %016llx %016llx %016llx %016llx\n",
+                    i * 8,
+                    (unsigned long long)tp[i], (unsigned long long)tp[i + 1],
+                    (unsigned long long)tp[i + 2], (unsigned long long)tp[i + 3]);
+        }
+    }
 }
 
 void nupRecordWorkerThread(void* thread_type, void* fn) {
