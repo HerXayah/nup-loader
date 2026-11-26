@@ -17,6 +17,7 @@ extern volatile u32 g_bad_reent_count;
 
 alignas(16) u8 __nx_exception_stack[0x4000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+u32 __nx_exception_ignoredebug = 1;
 
 static u64 g_abort_holder[8] = {};
 static u64 g_sdk_abort_holder[8] = {};
@@ -677,8 +678,15 @@ void nupDiagDumpLatestErpt(Handle hen_sm, FsFileSystem* sd) {
                                 u32 len = buf[at + 9] & 31;
                                 char code[32] = {};
                                 memcpy(code, buf + at + 10, len < 31 ? len : 31);
-                                nupLogf("[erpt] latest ErrorCode='%s' [idx=%u] (dumped %lld bytes to /kaihen/last_erpt.bin)\n",
-                                        code, chosen_k, (long long)pos);
+                                const char* desc =
+                                    strcmp(code, "2168-0000") == 0 ? " (Illegal Instruction)" :
+                                    strcmp(code, "2168-0001") == 0 ? " (Instruction Abort)" :
+                                    strcmp(code, "2168-0002") == 0 ? " (Data Abort)" :
+                                    strcmp(code, "2168-0003") == 0 ? " (Misaligned Access)" :
+                                    strcmp(code, "2168-0006") == 0 ? " (Break / Abort)" :
+                                    strcmp(code, "2168-0008") == 0 ? " (Disallowed SVC)" : "";
+                                nupLogf("[erpt] latest ErrorCode='%s'%s [idx=%u] (dumped %lld bytes to /kaihen/last_erpt.bin)\n",
+                                        code, desc, chosen_k, (long long)pos);
                                 code_logged = true;
                                 break;
                             }

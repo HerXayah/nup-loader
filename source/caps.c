@@ -39,6 +39,10 @@ void nupCollectRuntimeCaps(NupRuntimeCapabilities* caps, NupArchive* nup,
     svcGetInfo(&caps->donor_mem_total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&caps->donor_sysres_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&caps->donor_sysres_total, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+    if (R_SUCCEEDED(svcGetInfo(&caps->donor_remote_total, 31, CUR_PROCESS_HANDLE, 0))) {
+        caps->donor_remote_valid = true;
+        svcGetInfo(&caps->donor_remote_used, 32, CUR_PROCESS_HANDLE, 0);
+    }
 
     caps->donor_is_switch1 = ((caps->donor_pid >> 56) == 0x01);
     caps->vam_capable = (caps->donor_sysres_total > 0);
@@ -63,6 +67,7 @@ void nupCollectRuntimeCaps(NupRuntimeCapabilities* caps, NupArchive* nup,
                 caps->target_npdm_flags = npdm[0x0c];
                 caps->target_main_prio = npdm[0x0e];
                 caps->target_main_core = npdm[0x0f];
+                memcpy(&caps->target_remote_required, npdm + 0x10, 4);
                 memcpy(&caps->target_sysres_required, npdm + 0x14, 4);
                 memcpy(&caps->target_main_stack_size, npdm + 0x1c, 4);
                 memcpy(caps->target_proc_name, npdm + 0x20, 16);
@@ -156,6 +161,12 @@ void nupLogRuntimeCaps(const NupRuntimeCapabilities* c) {
                     (unsigned long long)(c->donor_sysres_total / (1024ULL * 1024ULL)),
                     (unsigned long long)c->donor_sysres_total,
                     (unsigned long long)c->donor_sysres_used);
+    if (c->donor_remote_valid) {
+        nupLogBufferedf("  GPU remote memory:         %llu MiB (0x%llx, used=%llu MiB)\n",
+                        (unsigned long long)(c->donor_remote_total / (1024ULL * 1024ULL)),
+                        (unsigned long long)c->donor_remote_total,
+                        (unsigned long long)(c->donor_remote_used / (1024ULL * 1024ULL)));
+    }
     nupLogBufferedf("  VAM enabled:               %s\n", c->vam_capable ? "YES" : "NO");
     nupLogBufferedf("  CompatibilityPack:         %s\n", cpack);
 
@@ -169,6 +180,8 @@ void nupLogRuntimeCaps(const NupRuntimeCapabilities* c) {
                         c->target_main_stack_size);
         nupLogBufferedf("  Declared system resource:  %u MiB (0x%x)\n",
                         c->target_sysres_required / (1024u * 1024u), c->target_sysres_required);
+        nupLogBufferedf("  Declared GPU remote mem:   %u MiB (0x%x)\n",
+                        c->target_remote_required / (1024u * 1024u), c->target_remote_required);
         if (c->target_sac_valid) {
             nupLogBufferedf("  Declared services (SAC):   %u client services (stack markers: %s)\n",
                             c->target_sac_count,
@@ -194,6 +207,15 @@ void nupLogRuntimeCaps(const NupRuntimeCapabilities* c) {
                     c->target_sysres_required / (1024u * 1024u));
     nupLogBufferedf("  Ordinary process memory:   RUNTIME-BOUNDED (donor free=%llu MiB)\n",
                     (unsigned long long)(donor_free / (1024ULL * 1024ULL)));
-    nupLogBufferedf("  GPU remote memory:         RUNTIME-BOUNDED (donor-inherited ceiling)\n");
+    if (c->donor_remote_valid) {
+        const bool less = c->target_npdm_valid && c->donor_remote_total < (u64)c->target_remote_required;
+        nupLogBufferedf("  GPU remote memory:         RUNTIME-BOUNDED (donor=%llu MiB, used=%llu MiB vs declared=%u MiB)%s\n",
+                        (unsigned long long)(c->donor_remote_total / (1024ULL * 1024ULL)),
+                        (unsigned long long)(c->donor_remote_used / (1024ULL * 1024ULL)),
+                        c->target_remote_required / (1024u * 1024u),
+                        less ? " [DONOR LOWER THAN DECLARED]" : "");
+    } else {
+        nupLogBufferedf("  GPU remote memory:         RUNTIME-BOUNDED (donor-inherited ceiling)\n");
+    }
     nupLogBufferedf("  Service ACL:               DONOR-INHERITED + HEN SM proxy fallback (0x1015 logged)\n");
 }

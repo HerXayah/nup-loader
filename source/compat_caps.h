@@ -12,9 +12,13 @@ typedef struct {
     u64 donor_mem_used;
     u64 donor_sysres_total;
     u64 donor_sysres_used;
+    u64 donor_remote_total;
+    u64 donor_remote_used;
+    bool donor_remote_valid;
 
     // Target container / effective main.npdm declarations (advisory ceilings, not hard minimums)
     u64 target_tid;
+    u32 target_remote_required;
     u32 target_sysres_required;
     u32 target_main_stack_size;
     u32 target_sac_count;

@@ -2603,6 +2603,14 @@ static char** hook_GetHostArgv(void) {
     return argv;
 }
 
+static void hook_GetProcessNamePointer(const char** out_name, u64* out_len) {
+    static const char fallback[] = "Application";
+    const char* name = (g_caps.target_npdm_valid && g_caps.target_proc_name[0])
+                           ? g_caps.target_proc_name : fallback;
+    if (out_name) *out_name = name;
+    if (out_len) *out_len = strlen(name);
+}
+
 static void hook_nnMain(void) {
     log_used_mem("before nnMain");
     nupOnBeforeNnMain();
@@ -2807,6 +2815,7 @@ static const HookProviderEntry g_hook_registry[] = {
     PROV_WRAP("nnMain", hook_nnMain, real_nnMain, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn2os11GetHostArgcEv", hook_GetHostArgc, real_GetHostArgc, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn2os11GetHostArgvEv", hook_GetHostArgv, real_GetHostArgv, HOOK_PROV_SVC, false),
+    PROV_ONLY("_ZN2nn4diag6detail21GetProcessNamePointerEPPKcPm", hook_GetProcessNamePointer, HOOK_PROV_SVC, true),
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEv", hook_AbortImpl0, real_AbortImpl0, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", hook_AbortImplRes, real_AbortImplRes, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZSt9terminatev", hook_StdTerminate, real_StdTerminate, HOOK_PROV_SVC, false),

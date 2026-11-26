@@ -351,6 +351,20 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     nupDiagStartHeartbeat();
     shrink_libnx_heap_for_game();
 
+    // Clear libnx's ThreadVars from main thread TLS [0x120..0x200) before handing off
+    // to the game's SDK (SDK 16+/19+/20+/22+ expect this area zeroed and use 0x1E0..0x1FF
+    // for their own C-library/TLS pointers). Preserve [0x100..0x120) which holds kernel
+    // state (pin count at 0x100, thread handle at 0x110).
+    {
+        u8* tls = (u8*)armGetTls();
+        nupLogf("[5/6] main TLS kernel=[0x%llx, 0x%llx, 0x%llx, 0x%llx] clearing [0x120..0x200)\n",
+                (unsigned long long)*(const u64*)(tls + 0x100),
+                (unsigned long long)*(const u64*)(tls + 0x108),
+                (unsigned long long)*(const u64*)(tls + 0x110),
+                (unsigned long long)*(const u64*)(tls + 0x118));
+        memset(tls + 0x120, 0, 0xE0);
+    }
+
     const Handle main_thread = envGetMainThreadHandle();
     if (init_start_addr) {
         nupLogf("[6/6] calling nn::init::Start(%s, thread=0x%x) @ %016llx\n",

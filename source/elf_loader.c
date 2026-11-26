@@ -449,6 +449,8 @@ static u64 lookup_in_module(const LoadedModule* mod, const char* name, bool* out
             for (u32 i = buckets[hv % nbucket]; i != 0 && i < nchain && i < mod->sym_count; i = chains[i]) {
                 if (syms[i].st_shndx == 0 || syms[i].st_value == 0 || syms[i].st_name >= mod->strsz)
                     continue;
+                if (ELF64_ST_BIND(syms[i].st_info) == 0 || (syms[i].st_other & 3) == 1 || (syms[i].st_other & 3) == 2)
+                    continue;
                 if (strcmp(mod->strtab + syms[i].st_name, name) == 0) {
                     if (out_weak) *out_weak = (ELF64_ST_BIND(syms[i].st_info) == STB_WEAK);
                     return mod->nso_base + syms[i].st_value;
@@ -459,6 +461,8 @@ static u64 lookup_in_module(const LoadedModule* mod, const char* name, bool* out
     }
     for (u32 i = 1; i < mod->sym_count; i++) {
         if (syms[i].st_shndx == 0 || syms[i].st_value == 0 || syms[i].st_name >= mod->strsz)
+            continue;
+        if (ELF64_ST_BIND(syms[i].st_info) == 0 || (syms[i].st_other & 3) == 1 || (syms[i].st_other & 3) == 2)
             continue;
         if (strcmp(mod->strtab + syms[i].st_name, name) == 0) {
             if (out_weak) *out_weak = (ELF64_ST_BIND(syms[i].st_info) == STB_WEAK);
@@ -503,7 +507,7 @@ u64 elfFindSymbolAfterAddr(const ModuleSet* set, u64 caller_addr, const char* na
     if (out_found_mod) *out_found_mod = "?";
     if (!set || !name || !name[0])
         return 0;
-    const u64 clean_caller = caller_addr & 0x0000ffffffffffffULL;
+    const u64 clean_caller = caller_addr & ((1ULL << 39) - 1);
     s32 caller_idx = -1;
     for (u32 m = 0; m < set->count; m++) {
         const LoadedModule* mod = &set->mods[m];
@@ -787,6 +791,8 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
         u64 addr = 0;
         bool was_hooked = false;
         if (name[0]) {
+            const bool is_local_or_hidden = (sym->st_shndx != 0) &&
+                (ELF64_ST_BIND(sym->st_info) == 0 || (sym->st_other & 3) != 0);
             const bool is_c1_undef = mod->is_compat && strcmp(mod->name, "compat1") == 0 && sym->st_shndx == 0;
             if (strcmp(name, "_ZN2nn2ro25LookupNextSymbolForCompatEPmPKc") == 0) {
                 addr = (u64)(uintptr_t)hooksLookupNextForCompat;
@@ -794,8 +800,12 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
             } else if (strcmp(name, "_ZN2nn2ro12ProtectRelroEPKvS2_S2_S2_S2_") == 0) {
                 addr = (u64)(uintptr_t)stub_protect_relro;
                 was_hooked = true;
+            } else if (is_local_or_hidden) {
+                addr = mod->nso_base + sym->st_value;
             } else {
                 addr = is_c1_undef ? elfFindSymbolSkipCompat1(set, name) : elfFindSymbol(set, name);
+                if (!addr && sym->st_shndx != 0)
+                    addr = mod->nso_base + sym->st_value;
                 if (!addr) {
                     if (strcmp(name, "_ZN2nn2os18SdkAllocateTlsSlotEPNS0_7TlsSlotEPFvmE") == 0)
                         addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE");
