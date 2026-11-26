@@ -526,11 +526,184 @@ void nupDiagDumpAbortContext(u64 caller) {
                                             nupLogf("    sub+%02x str: '%.96s'\n", j * 8, (const char*)(uintptr_t)sq[j]);
                                         }
                                     }
+                                    // Dump CentralResource/sub vtable[0..15]
+                                    {
+                                        nupLogf("    [sub vtable @ %s]:\n", svts);
+                                        for (u32 vi = 0; vi < 16; vi++) {
+                                            const u64 vf = nupStripCodePac(svq[vi]);
+                                            if (!vf) continue;
+                                            char vfs[64];
+                                            nupFmtAddrMod(vf, vfs, sizeof(vfs));
+                                            nupLogf("      vt[%u]=%s\n", vi, vfs);
+                                        }
+                                    }
                                     const u32* sfi = (const u32*)(uintptr_t)sfn2;
                                     nupLogf("    [sub->vtable[2] @ %s (48 insns)]:\n", sf2s);
                                     for (u32 j = 0; j < 48; j += 4) {
                                         nupLogf("      +%02x: %08x %08x %08x %08x\n",
                                                 j * 4, sfi[j], sfi[j + 1], sfi[j + 2], sfi[j + 3]);
+                                    }
+                                    // Unwrap 3-insn virtual forwarding thunk: ldr x8, [x0, #imm]! ; ldr xR, [x8, #16] ; br xR
+                                    if ((sfi[0] & 0xFFE00FFFu) == 0xF8400C08u && (sfi[2] & 0xFFFFFC1Fu) == 0xD61F0000u) {
+                                        const s64 simm9 = (s64)(s32)(sfi[0] << 11) >> 23;
+                                        const u64 emb = sub + (u64)simm9;
+                                        if ((emb & 7ULL) == 0 && is_readable_addr(emb, 0x40)) {
+                                            const u64 evt = nupStripCodePac(*(const u64*)(uintptr_t)emb);
+                                            if (evt && (evt & 7ULL) == 0 && is_readable_addr(evt, 0x80)) {
+                                                const u64* evq = (const u64*)(uintptr_t)evt;
+                                                const u64 efn2 = nupStripCodePac(evq[2]);
+                                                char evts[64], ef2s[64];
+                                                nupFmtAddrMod(evt, evts, sizeof(evts));
+                                                nupFmtAddrMod(efn2, ef2s, sizeof(ef2s));
+                                                nupLogf("  [abort-emb thunk -> emb=0x%llx (sub+0x%llx) vtable=%s vtable[2]=%s]\n",
+                                                        (unsigned long long)emb, (unsigned long long)simm9, evts, ef2s);
+                                                for (u32 vi = 0; vi < 16; vi++) {
+                                                    const u64 vf = nupStripCodePac(evq[vi]);
+                                                    if (!vf) continue;
+                                                    char vfs[64];
+                                                    nupFmtAddrMod(vf, vfs, sizeof(vfs));
+                                                    nupLogf("    emb vt[%u]=%s\n", vi, vfs);
+                                                }
+                                                // Skip repeating 0x20-byte small-block bin array if present, then dump trailing fields
+                                                u32 bin_cnt = 0;
+                                                u64 tail_off = 0;
+                                                if (is_readable_addr(emb, 0x640)) {
+                                                    const u64* eq = (const u64*)(uintptr_t)emb;
+                                                    const u64 bin_tag = eq[1];
+                                                    if (bin_tag != 0 && eq[5] == bin_tag) {
+                                                        while (bin_cnt < 48 && eq[bin_cnt * 4 + 1] == bin_tag)
+                                                            bin_cnt++;
+                                                        tail_off = (u64)bin_cnt * 0x20ULL;
+                                                        nupLogf("    emb bins=%u (tag=0x%llx, end=emb+0x%llx)\n",
+                                                                bin_cnt, (unsigned long long)bin_tag, (unsigned long long)tail_off);
+                                                    }
+                                                    // Dump 0x140 bytes after the bin array (bounded by 0x640)
+                                                    u64 dump_end = tail_off + 0x140ULL;
+                                                    if (dump_end > 0x640ULL) dump_end = 0x640ULL;
+                                                    for (u64 off = tail_off; off + 32 <= dump_end; off += 32) {
+                                                        const u32 qi = (u32)(off / 8);
+                                                        nupLogf("    emb+%03llx: %016llx %016llx %016llx %016llx\n",
+                                                                (unsigned long long)off,
+                                                                (unsigned long long)eq[qi], (unsigned long long)eq[qi + 1],
+                                                                (unsigned long long)eq[qi + 2], (unsigned long long)eq[qi + 3]);
+                                                    }
+                                                    // Scan emb[0..0x640] for .rodata strings
+                                                    for (u32 qi = 0; qi < 0x640 / 8; qi++) {
+                                                        size_t slen = 0;
+                                                        if (is_in_module_rodata(eq[qi]) && is_printable_str_at(eq[qi], 2, &slen)) {
+                                                            nupLogf("    emb+%03x str: '%.96s'\n", qi * 8, (const char*)(uintptr_t)eq[qi]);
+                                                        }
+                                                    }
+                                                }
+                                                if (efn2 && (efn2 & 3ULL) == 0 && is_readable_addr(efn2, 0x180)) {
+                                                    nupLogf("    [emb->vtable[2] @ %s (96 insns)]:\n", ef2s);
+                                                    const u32* efi = (const u32*)(uintptr_t)efn2;
+                                                    for (u32 j = 0; j < 96; j += 4) {
+                                                        nupLogf("      +%03x: %08x %08x %08x %08x\n",
+                                                                j * 4, efi[j], efi[j + 1], efi[j + 2], efi[j + 3]);
+                                                    }
+                                                    // Follow up to 4 unique internal BL or tail-call B targets in emb->vtable[2]
+                                                    u64 ecallees[4] = {};
+                                                    u32 ecal_cnt = 0;
+                                                    for (u32 j = 0; j < 96 && ecal_cnt < 4; j++) {
+                                                        const u32 ew = efi[j];
+                                                        if ((ew & 0xFC000000u) == 0x94000000u || (ew & 0xFC000000u) == 0x14000000u) {
+                                                            s64 boff = (s64)(s32)(ew << 6) >> 4;
+                                                            const u64 btgt = efn2 + (u64)j * 4ULL + (u64)boff;
+                                                            if (btgt >= efn2 && btgt < efn2 + 0x180ULL)
+                                                                continue; // internal branch inside same dump
+                                                            bool seen = false;
+                                                            for (u32 s = 0; s < ecal_cnt; s++)
+                                                                if (ecallees[s] == btgt) { seen = true; break; }
+                                                            if (seen) continue;
+                                                            if ((btgt & 3ULL) == 0 && is_readable_addr(btgt, 0xC0)) {
+                                                                ecallees[ecal_cnt++] = btgt;
+                                                                char ets[64];
+                                                                nupFmtAddrMod(btgt, ets, sizeof(ets));
+                                                                nupLogf("    [emb-callee #%u @ %s (48 insns)]:\n", ecal_cnt, ets);
+                                                                const u32* eci = (const u32*)(uintptr_t)btgt;
+                                                                for (u32 m = 0; m < 48; m += 4) {
+                                                                    nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                                                            m * 4, eci[m], eci[m + 1], eci[m + 2], eci[m + 3]);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Also inspect sub's own backing pointer at sub+0x20 if it points to a vtable object
+                                    const u64 leaf = sq[4];
+                                    if (leaf && leaf != sub && leaf != obj && (leaf & 7ULL) == 0 &&
+                                        !is_in_module_rodata(leaf) && is_readable_addr(leaf, 0x100)) {
+                                        const u64* lq = (const u64*)(uintptr_t)leaf;
+                                        const u64 lvt = nupStripCodePac(lq[0]);
+                                        if (lvt && (lvt & 7ULL) == 0 && is_readable_addr(lvt, 0x80)) {
+                                            const u64* lvq = (const u64*)(uintptr_t)lvt;
+                                            const u64 lfn2 = nupStripCodePac(lvq[2]);
+                                            bool lfn2_is_code = false;
+                                            for (u32 m = 0; m < g_mods.count; m++) {
+                                                const LoadedModule* mod = &g_mods.mods[m];
+                                                if (mod->rodata_off && lfn2 >= mod->nso_base && lfn2 < mod->nso_base + mod->rodata_off) {
+                                                    lfn2_is_code = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (lfn2_is_code && (lfn2 & 3ULL) == 0 && is_readable_addr(lfn2, 0x100)) {
+                                                char lvts[64], lf2s[64];
+                                                nupFmtAddrMod(lvt, lvts, sizeof(lvts));
+                                                nupFmtAddrMod(lfn2, lf2s, sizeof(lf2s));
+                                                nupLogf("  [abort-leaf sub+20 -> leaf=0x%llx vtable=%s vtable[2]=%s]\n",
+                                                        (unsigned long long)leaf, lvts, lf2s);
+                                                for (u32 vi = 0; vi < 16; vi++) {
+                                                    const u64 vf = nupStripCodePac(lvq[vi]);
+                                                    if (!vf) continue;
+                                                    char vfs[64];
+                                                    nupFmtAddrMod(vf, vfs, sizeof(vfs));
+                                                    nupLogf("    leaf vt[%u]=%s\n", vi, vfs);
+                                                }
+                                                for (u32 j = 0; j < 32; j += 4) {
+                                                    nupLogf("    leaf+%02x: %016llx %016llx %016llx %016llx\n",
+                                                            j * 8,
+                                                            (unsigned long long)lq[j], (unsigned long long)lq[j + 1],
+                                                            (unsigned long long)lq[j + 2], (unsigned long long)lq[j + 3]);
+                                                }
+                                                for (u32 j = 0; j < 32; j++) {
+                                                    size_t slen = 0;
+                                                    if (is_in_module_rodata(lq[j]) && is_printable_str_at(lq[j], 2, &slen)) {
+                                                        nupLogf("    leaf+%02x str: '%.96s'\n", j * 8, (const char*)(uintptr_t)lq[j]);
+                                                    }
+                                                }
+                                                const u32* lfi = (const u32*)(uintptr_t)lfn2;
+                                                nupLogf("    [leaf->vtable[2] @ %s (64 insns)]:\n", lf2s);
+                                                for (u32 j = 0; j < 64; j += 4) {
+                                                    nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                                            j * 4, lfi[j], lfi[j + 1], lfi[j + 2], lfi[j + 3]);
+                                                }
+                                                // Follow first external BL or B from leaf->vtable[2]
+                                                for (u32 j = 0; j < 64; j++) {
+                                                    const u32 lw = lfi[j];
+                                                    if ((lw & 0xFC000000u) == 0x94000000u || (lw & 0xFC000000u) == 0x14000000u) {
+                                                        s64 boff = (s64)(s32)(lw << 6) >> 4;
+                                                        const u64 btgt = lfn2 + (u64)j * 4ULL + (u64)boff;
+                                                        if (btgt >= lfn2 && btgt < lfn2 + 0x100ULL)
+                                                            continue;
+                                                        if ((btgt & 3ULL) == 0 && is_readable_addr(btgt, 0xC0)) {
+                                                            char lts[64];
+                                                            nupFmtAddrMod(btgt, lts, sizeof(lts));
+                                                            nupLogf("    [leaf-callee @ %s (48 insns)]:\n", lts);
+                                                            const u32* lci = (const u32*)(uintptr_t)btgt;
+                                                            for (u32 m = 0; m < 48; m += 4) {
+                                                                nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                                                        m * 4, lci[m], lci[m + 1], lci[m + 2], lci[m + 3]);
+                                                            }
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     break;
                                 }
