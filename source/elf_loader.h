@@ -17,7 +17,9 @@ typedef struct {
     u64 nro_base;
     u64 nso_base;
     void* src_buf;
+    u64 src_size;
     void* bss_buf;
+    u64 bss_size;
     u64 rodata_off;
     u64 rodata_size;
     u64 data_mem_off;

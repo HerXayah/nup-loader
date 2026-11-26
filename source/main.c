@@ -17,7 +17,7 @@
 #include "trace.h"
 #include "ui.h"
 
-#define NUP_BUILD_TAG "0325-cap6"
+#define NUP_BUILD_TAG "0325-cap7"
 
 // Keep libnx's own heap compact (256 MiB: enough for NUP TOC + NSO staging)
 // so ~5.8 GiB remains free for the launched game's heap and GPU/virtual memory.
@@ -86,11 +86,13 @@ static void shrink_libnx_heap_for_game(void) {
     }
     for (u32 i = 0; i < g_mods.count; i++) {
         if (g_mods.mods[i].src_buf) {
-            const u64 e = (u64)(uintptr_t)g_mods.mods[i].src_buf + g_mods.mods[i].total_size;
+            const u64 sz = g_mods.mods[i].src_size ? g_mods.mods[i].src_size : g_mods.mods[i].total_size;
+            const u64 e = (u64)(uintptr_t)g_mods.mods[i].src_buf + sz;
             if (e > high) high = e;
         }
         if (g_mods.mods[i].bss_buf) {
-            const u64 e = (u64)(uintptr_t)g_mods.mods[i].bss_buf + g_mods.mods[i].total_size;
+            const u64 sz = g_mods.mods[i].bss_size ? g_mods.mods[i].bss_size : g_mods.mods[i].total_size;
+            const u64 e = (u64)(uintptr_t)g_mods.mods[i].bss_buf + sz;
             if (e > high) high = e;
         }
     }

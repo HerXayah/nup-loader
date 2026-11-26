@@ -332,6 +332,7 @@ void nupDiagDumpAbortContext(u64 caller) {
         // Track ADRP base pages per register x0..x30 to resolve ADRP+ADD strings
         u64 adrp_page[32] = {};
         bool adrp_valid[32] = {};
+        u64 last_internal_bl = 0;
         for (u32 i = 0; i < nins; i++) {
             const u32 w = ins[i];
             const u64 pc = base_pc + (u64)i * 4ULL;
@@ -376,7 +377,19 @@ void nupDiagDumpAbortContext(u64 caller) {
                 } else {
                     nupLogf("  [abort-bl @ %s]: BL %s (%s+0x%llx)\n",
                             pcs, ts, sym ? sym : "?", (unsigned long long)(sym ? soff : 0));
+                    last_internal_bl = tgt;
                 }
+            }
+        }
+        // Also dump the entry of the last internal BL target before abort() (e.g. failing helper)
+        if (last_internal_bl && (last_internal_bl & 3ULL) == 0 && is_readable_addr(last_internal_bl, 0x80)) {
+            const u32* cal = (const u32*)(uintptr_t)last_internal_bl;
+            char ls[64];
+            nupFmtAddrMod(last_internal_bl, ls, sizeof(ls));
+            nupLogf("  [abort-callee @ %s (32 insns)]:\n", ls);
+            for (u32 i = 0; i < 32; i += 4) {
+                nupLogf("    +%02x: %08x %08x %08x %08x\n",
+                        i * 4, cal[i], cal[i + 1], cal[i + 2], cal[i + 3]);
             }
         }
     }

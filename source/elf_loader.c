@@ -335,12 +335,16 @@ static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
         out->nro_base = nro_base;
         out->nso_base = nro_base + 0x1000;
         out->src_buf = buf;
+        out->src_size = nro_img_sz;
         out->bss_buf = bss_buf;
+        out->bss_size = bss_buf ? bss_seg_sz : 0;
     } else {
         out->nro_base = 0;
         out->nso_base = (u64)(uintptr_t)(buf + 0x1000);
         out->src_buf = buf;
+        out->src_size = nro_img_sz;
         out->bss_buf = NULL;
+        out->bss_size = 0;
     }
     out->rodata_off = rm;
     out->rodata_size = ro_seg_sz;

@@ -2114,19 +2114,25 @@ static void hook_QueryMemoryInfo(void* out) {
             q[0] = 0xC0000000ULL;
             q[1] = 0x2C000000ULL;
         } else if (g_caps.target_is_switch1 && q[0] > 0xC0000000ULL) {
-            // Switch 1 ABI expects <= 3 GiB available application RAM.
-            // Exclude CompatibilityPack's hidden compat2 heap from totalUsedMemorySize so
-            // (avail - used) cannot underflow when compat2 pre-allocates 3 GiB on Switch 2.
-            if (g_compat_heap_reserved > 0 && q[1] >= g_compat_heap_reserved)
-                q[1] -= g_compat_heap_reserved;
-            q[0] = 0xC0000000ULL;
-            // Guarantee reported free (q[0] - q[1]) never underflows and never exceeds
-            // actual remaining physical RAM (leaving 64 MiB headroom for Horizon/NVN/threads).
-            const u64 safe_free = (real_free > 0x4000000ULL)
-                                      ? (real_free - 0x4000000ULL)
-                                      : (real_free / 2ULL);
-            if (q[1] >= q[0] || (q[0] - q[1]) > safe_free)
-                q[1] = (q[0] > safe_free) ? (q[0] - safe_free) : 0;
+            if (g_compat_heap_marked || !g_caps.has_compat2) {
+                // Report retail Switch 1 application RAM ceiling (3,285 MiB) and base
+                // game-visible free memory directly on actual remaining physical RAM
+                // (leaving 96 MiB headroom for Horizon/NVN/threads), so donor NSOs and
+                // libnx staging overhead don't double-starve Switch 1 games.
+                const u64 sw1_avail = (orig_avail < 0xCD500000ULL) ? orig_avail : 0xCD500000ULL;
+                const u64 safe_free = (real_free > 0x6000000ULL) ? (real_free - 0x6000000ULL) : 0ULL;
+                const u64 max_game_free = (sw1_avail > 0x8000000ULL) ? (sw1_avail - 0x8000000ULL) : sw1_avail;
+                const u64 game_free = (safe_free < max_game_free) ? safe_free : max_game_free;
+                q[0] = sw1_avail;
+                q[1] = sw1_avail - game_free;
+            } else {
+                // Before compat2 finishes reserving its hidden 3 GiB heap, keep the
+                // conservative 3 GiB view so compat2 initialization sees the expected cap.
+                q[0] = 0xC0000000ULL;
+                const u64 safe_free = (real_free > 0x6000000ULL) ? (real_free - 0x6000000ULL) : 0ULL;
+                if (q[1] >= q[0] || (q[0] - q[1]) > safe_free)
+                    q[1] = (q[0] > safe_free) ? (q[0] - safe_free) : 0;
+            }
         }
         // hook_SetMemoryHeapSize calls svcSetHeapSize directly, so sdk's cached heap size
         // (q[2]) stays 0 unless we synchronize it with the game's own tracked heap size
