@@ -15,6 +15,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "nup.h"
+#include "trace.h"
 
 #define MAX_NUP_ENTRIES 32
 
@@ -166,7 +167,8 @@ static void draw(const char* status) {
         }
         printf("\n");
     }
-    printf("  Up/Down select   A Launch   X rescan   B/+ exit\n\n");
+    printf("  Up/Down select   A Launch   Y Trace Launch   L Static Audit\n");
+    printf("  X rescan         B/+ exit\n\n");
     if (status && status[0])
         printf("  %s\n", status);
     if (g_skip_note[0])
@@ -231,6 +233,7 @@ static void on_sdk_user_exception(void* info) {
         if (!next_fp || next_fp <= fp_addr || (next_fp - fp_addr) > 0x100000ULL) break;
         fp_addr = next_fp;
     }
+    nupTraceDumpRecent("SDK USER EXCEPTION", 64);
     nupLogFlush();
 }
 
@@ -306,6 +309,7 @@ static void heartbeat_thread_fn(void* arg) {
     (void)arg;
     for (u32 t = 1; t <= 12; t++) {
         svcSleepThread(1000000000ULL);
+        nupTracePollHeartbeat(t);
         nupLogFlush();
         u64 used = 0, sys_used = 0, sys_tot = 0, ns_used = 0, ns_tot = 0;
         Result urc = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
@@ -313,14 +317,26 @@ static void heartbeat_thread_fn(void* arg) {
         svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&ns_used, InfoType_UsedNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
         svcGetInfo(&ns_tot, InfoType_TotalNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
-        nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u\n",
-                t, (unsigned long long)used, urc,
-                (unsigned long long)ns_used, (unsigned long long)ns_tot,
-                (unsigned long long)sys_used, (unsigned long long)sys_tot,
-                g_open_file_count, g_worker_count, g_bad_reent_count);
+        if (nupTraceIsEnabled()) {
+            nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u tr_seq=%u\n",
+                    t, (unsigned long long)used, urc,
+                    (unsigned long long)ns_used, (unsigned long long)ns_tot,
+                    (unsigned long long)sys_used, (unsigned long long)sys_tot,
+                    g_open_file_count, g_worker_count, g_bad_reent_count,
+                    nupTraceTotalSeq());
+        } else {
+            nupLogf("[hb] %us used=0x%llx(rc=0x%x) ns=0x%llx/0x%llx sysres=0x%llx/0x%llx files=%u workers=%u reent=%u\n",
+                    t, (unsigned long long)used, urc,
+                    (unsigned long long)ns_used, (unsigned long long)ns_tot,
+                    (unsigned long long)sys_used, (unsigned long long)sys_tot,
+                    g_open_file_count, g_worker_count, g_bad_reent_count);
+        }
     }
+    u32 sec = 12;
     for (;;) {
         svcSleepThread(2000000000ULL);
+        sec += 2;
+        nupTracePollHeartbeat(sec);
         nupLogFlush();
     }
 }
@@ -435,7 +451,7 @@ void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
     for (int i = 0; i < 20 && fp; i++) {
         if (!is_readable_addr((u64)(uintptr_t)fp, 16))
             break;
-        u64 lr = fp[1];
+        u64 lr = fp[1] & 0x0000ffffffffffffULL;
         u64* nx = (u64*)(uintptr_t)fp[0];
         char bt_s[64];
         fmt_addr_mod(lr, bt_s, sizeof(bt_s));
@@ -449,15 +465,18 @@ void nupLogBacktrace(const char* tag, u64 caller, u64 arg0, u64 arg1) {
             break;
         fp = nx;
     }
+    nupTraceDumpRecent(tag, 64);
     nupLogFlush();
 }
 
 static void on_abort_observer(const void* info) {
     dump_abort_info("AbortObserver", info);
+    nupTraceDumpRecent("AbortObserver", 64);
 }
 
 static void on_sdk_abort_observer(const void* info) {
     dump_abort_info("SdkAbortObserver", info);
+    nupTraceDumpRecent("SdkAbortObserver", 64);
 }
 
 static bool g_abort_observers_registered = false;
@@ -649,18 +668,104 @@ static void dump_latest_erpt(Handle hen_sm) {
     serviceClose(&r);
 }
 
-static Result launch_nup(const NupEntry* entry, bool headless) {
+static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_status_sz) {
+    consoleClear();
+    printf("  Static Audit: %s\n", entry->label);
+    printf("  Title ID: %016llx\n\n", (unsigned long long)entry->title_id);
+    consoleUpdate(NULL);
+
+    char audit_path[0x100];
+    snprintf(audit_path, sizeof(audit_path), "/kaihen/nup-audit-%016llx.txt",
+             (unsigned long long)entry->title_id);
+    nupLogInit(&g_sd, audit_path);
+    nupLogf("=== nup-loader [build=0325-trace1] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
+            entry->path, (unsigned long long)entry->title_id,
+            entry->is_raw ? "RAW" : "NUP");
+
+    {
+        u64 pid = 0, used = 0, tot = 0, sys_used = 0, sys_tot = 0;
+        svcGetInfo(&pid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+        nupLogf("[host] pid=%016llx mem=0x%llx/0x%llx sysres=0x%llx/0x%llx\n",
+                (unsigned long long)pid,
+                (unsigned long long)used, (unsigned long long)tot,
+                (unsigned long long)sys_used, (unsigned long long)sys_tot);
+    }
+
+    NupFileInfo exefs[NUP_MAX_EXEFS_FILES];
+    u32 exefs_count = 0;
+    Result rc = 0;
+    if (entry->is_raw) {
+        if (!nupProbeRaw(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
+            nupLogf("[!] nupProbeRaw failed\n");
+            nupLogClose();
+            snprintf(out_status, out_status_sz, "audit failed: probe raw");
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+        rc = nupOpenRaw(&g_nup, &g_sd, entry->path);
+    } else {
+        if (!nupProbe(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
+            nupLogf("[!] nupProbe failed\n");
+            nupLogClose();
+            snprintf(out_status, out_status_sz, "audit failed: probe nup");
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+        rc = nupOpenFull(&g_nup, &g_sd, entry->path);
+    }
+    if (R_FAILED(rc)) {
+        nupLogf("[!] open failed: 0x%x\n", rc);
+        nupLogClose();
+        snprintf(out_status, out_status_sz, "audit open failed: 0x%x", rc);
+        return rc;
+    }
+
+    ModuleSet audit_mods = {};
+    rc = elfLoadNupModulesForAudit(&audit_mods, &g_nup, exefs, exefs_count);
+    if (R_FAILED(rc)) {
+        nupLogf("[!] elfLoadNupModulesForAudit failed: 0x%x\n", rc);
+        nupClose(&g_nup);
+        nupLogClose();
+        snprintf(out_status, out_status_sz, "audit read NSO failed: 0x%x", rc);
+        return rc;
+    }
+
+    const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
+    elfAttachSwitch1Compat(&audit_mods, sel_tid);
+    printf("  Auditing %u modules...\n", audit_mods.count);
+    consoleUpdate(NULL);
+
+    ElfAuditSummary sum = {};
+    elfRunStaticAudit(&audit_mods, hooksResolve, &sum);
+
+    elfUnloadAuditModules(&audit_mods);
+    nupClose(&g_nup);
+    nupLogClose();
+
+    snprintf(out_status, out_status_sz,
+             "Audit -> %s (mods=%u entry=%s unres=%u hooked=%u unhook_fs=%u sys=%u)",
+             audit_path, sum.module_count, sum.entry_kind,
+             sum.unresolved_count, sum.hooked_count,
+             sum.unhooked_fs_aoc, sum.unhooked_sys);
+    return 0;
+}
+
+static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) {
     g_abort_observers_registered = false;
     g_sdk_ex_registered = false;
     g_worker_count = 0;
+    nupTraceReset(trace_mode);
     nupLogInit(&g_sd, "/kaihen/nup-loader.log");
-    nupLogf("=== nup-loader [build=0325-s1compat5] (%s): %s (tid=%016llx) ===\n",
+    nupLogf("=== nup-loader [build=0325-trace1] (%s%s): %s (tid=%016llx) ===\n",
             headless ? "headless" : "ui",
+            trace_mode ? "+TRACE" : "",
             entry->path, (unsigned long long)entry->title_id);
 
     if (!headless) {
         consoleClear();
-        printf("  Launching %s\n", entry->label);
+        printf("  %s %s\n", trace_mode ? "TRACE Launching" : "Launching", entry->label);
         printf("  Title ID: %016llx\n", (unsigned long long)entry->title_id);
         printf("  Log: /kaihen/nup-loader.log\n\n");
         consoleUpdate(NULL);
@@ -736,6 +841,10 @@ static Result launch_nup(const NupEntry* entry, bool headless) {
 
     const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
     elfAttachSwitch1Compat(&g_mods, sel_tid);
+    if (trace_mode) {
+        if (!headless) { printf("  [4/6] Running static hook/symbol audit...\n"); consoleUpdate(NULL); }
+        elfRunStaticAudit(&g_mods, hooksResolve, NULL);
+    }
     if (!headless) { printf("  [4/6] Relocating %u modules & hooking nn::fs / nn::sm...\n", g_mods.count); consoleUpdate(NULL); }
     hooksInit(&g_nup, &g_sd, sel_tid, hen_sm);
     u32 unresolved = 0;
@@ -945,7 +1054,8 @@ static Result launch_nup(const NupEntry* entry, bool headless) {
     return 0;
 }
 
-static bool try_read_autolaunch(NupEntry* out) {
+static bool try_read_autolaunch(NupEntry* out, bool* out_trace) {
+    if (out_trace) *out_trace = false;
     if (!g_sd_open) return false;
     FsFile f = {};
     if (R_FAILED(nupRawFsOpenFile(&g_sd, "/kaihen/autolaunch.txt", FsOpenMode_Read, &f)))
@@ -963,6 +1073,11 @@ static bool try_read_autolaunch(NupEntry* out) {
     while (*end && *end != '\r' && *end != '\n') end++;
     while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '/')) end--;
     *end = '\0';
+    if (strncmp(p, "trace:", 6) == 0) {
+        if (out_trace) *out_trace = true;
+        p += 6;
+        while (*p == ' ' || *p == '\t') p++;
+    }
     if (!p[0]) return false;
 
     memset(out, 0, sizeof(*out));
@@ -987,8 +1102,9 @@ int main(void) {
     // Headless auto-launch if /kaihen/autolaunch.txt exists:
     // never touches consoleInit / vi2 / nv / hid before handing off to the game!
     NupEntry auto_entry = {};
-    if (try_read_autolaunch(&auto_entry)) {
-        launch_nup(&auto_entry, true);
+    bool auto_trace = false;
+    if (try_read_autolaunch(&auto_entry, &auto_trace)) {
+        launch_nup(&auto_entry, true, auto_trace);
         if (g_sd_open) fsFsClose(&g_sd);
         return 0;
     }
@@ -1031,8 +1147,15 @@ int main(void) {
             continue;
         }
 
-        if (down & HidNpadButton_A && g_entry_count > 0) {
-            const Result rc = launch_nup(&g_entries[g_cursor], false);
+        if ((down & HidNpadButton_L) && g_entry_count > 0) {
+            audit_nup(&g_entries[g_cursor], status, sizeof(status));
+            draw(status);
+            continue;
+        }
+
+        if ((down & (HidNpadButton_A | HidNpadButton_Y)) && g_entry_count > 0) {
+            const bool trace_mode = (down & HidNpadButton_Y) != 0;
+            const Result rc = launch_nup(&g_entries[g_cursor], false, trace_mode);
             if (R_FAILED(rc)) {
                 snprintf(status, sizeof(status), "launch failed: 0x%x (press any key)", rc);
                 printf("\n  %s\n", status);

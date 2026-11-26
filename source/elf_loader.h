@@ -51,14 +51,29 @@ typedef struct {
     bool has_compat;
 } ModuleSet;
 
+typedef struct {
+    u32 module_count;
+    u32 unresolved_count;
+    u32 hooked_count;
+    u32 unhooked_fs_aoc;
+    u32 unhooked_sys;
+    bool has_compat;
+    char entry_kind[16];
+} ElfAuditSummary;
+
 typedef u64 (*SymbolHookFn)(const char* name, u64 real_addr);
 
 Result elfLoadNupModules(ModuleSet* set, NupArchive* nup,
                          const NupFileInfo* exefs, u32 exefs_count);
+Result elfLoadNupModulesForAudit(ModuleSet* set, NupArchive* nup,
+                                 const NupFileInfo* exefs, u32 exefs_count);
+void elfUnloadAuditModules(ModuleSet* set);
 bool elfAttachSwitch1Compat(ModuleSet* set, u64 target_tid);
 void elfInitSwitch1CompatParams(const ModuleSet* set);
 void elfRunCompatInitArrays(ModuleSet* set);
 Result elfRelocateAll(ModuleSet* set, SymbolHookFn hook_fn, u32* out_unresolved);
+void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
+                       ElfAuditSummary* out_summary);
 u64 elfFindSymbol(const ModuleSet* set, const char* name);
 u64 elfFindSymbolSkipCompat1(const ModuleSet* set, const char* name);
 const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off);

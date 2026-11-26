@@ -2,6 +2,7 @@
 #include "elf_loader.h"
 #include "hooks.h"
 #include "log.h"
+#include "trace.h"
 #include "zbic.h"
 
 #include <malloc.h>
@@ -201,7 +202,8 @@ static bool parse_mod0(LoadedModule* mod) {
     return true;
 }
 
-static Result load_one_nso(NupArchive* nup, const NupFileInfo* fi, u32 index, LoadedModule* out) {
+static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
+                              LoadedModule* out, bool map_executable) {
     memset(out, 0, sizeof(*out));
     snprintf(out->name, sizeof(out->name), "%.31s", fi->name);
 
@@ -310,41 +312,54 @@ static Result load_one_nso(NupArchive* nup, const NupFileInfo* fi, u32 index, Lo
         w[2] = first[2] ? (0x1000u + first[2]) : 0;
     }
 
-    u8* bss_buf = NULL;
-    if (bss_seg_sz) {
-        bss_buf = (u8*)memalign(0x1000, (size_t)bss_seg_sz);
-        if (!bss_buf) {
-            free(buf);
-            return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    if (map_executable) {
+        u8* bss_buf = NULL;
+        if (bss_seg_sz) {
+            bss_buf = (u8*)memalign(0x1000, (size_t)bss_seg_sz);
+            if (!bss_buf) {
+                free(buf);
+                return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+            }
+            memset(bss_buf, 0, (size_t)bss_seg_sz);
         }
-        memset(bss_buf, 0, (size_t)bss_seg_sz);
-    }
 
-    u64 nro_base = 0;
-    rc = ldrRoLoadNro(&nro_base, (u64)(uintptr_t)buf, nro_img_sz,
-                      (u64)(uintptr_t)bss_buf, bss_seg_sz);
-    if (R_FAILED(rc)) {
-        free(buf);
-        free(bss_buf);
-        return rc;
-    }
+        u64 nro_base = 0;
+        rc = ldrRoLoadNro(&nro_base, (u64)(uintptr_t)buf, nro_img_sz,
+                          (u64)(uintptr_t)bss_buf, bss_seg_sz);
+        if (R_FAILED(rc)) {
+            free(buf);
+            free(bss_buf);
+            return rc;
+        }
 
-    out->nro_base = nro_base;
-    out->nso_base = nro_base + 0x1000;
-    out->src_buf = buf;
-    out->bss_buf = bss_buf;
+        out->nro_base = nro_base;
+        out->nso_base = nro_base + 0x1000;
+        out->src_buf = buf;
+        out->bss_buf = bss_buf;
+    } else {
+        out->nro_base = 0;
+        out->nso_base = (u64)(uintptr_t)(buf + 0x1000);
+        out->src_buf = buf;
+        out->bss_buf = NULL;
+    }
     out->rodata_off = rm;
     out->rodata_size = ro_seg_sz;
     out->data_mem_off = dm;
     out->total_size = dm + data_seg_sz + bss_seg_sz;
 
-    if (!parse_mod0(out))
+    if (!parse_mod0(out)) {
+        if (!map_executable) {
+            free(buf);
+            out->src_buf = NULL;
+        }
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
     return 0;
 }
 
-Result elfLoadNupModules(ModuleSet* set, NupArchive* nup,
-                         const NupFileInfo* exefs, u32 exefs_count) {
+static Result load_nup_modules_ex(ModuleSet* set, NupArchive* nup,
+                                  const NupFileInfo* exefs, u32 exefs_count,
+                                  bool map_executable) {
     memset(set, 0, sizeof(*set));
 
     NupFileInfo sorted[MAX_LOADED_MODULES];
@@ -370,15 +385,42 @@ Result elfLoadNupModules(ModuleSet* set, NupArchive* nup,
     }
 
     for (u32 i = 0; i < n; i++) {
-        printf("  Mapping %-8s (%llu KB)...\n", sorted[i].name,
-               (unsigned long long)(sorted[i].size / 1024));
+        printf("  %s %-8s (%llu KB)...\n",
+               map_executable ? "Mapping" : "Reading",
+               sorted[i].name, (unsigned long long)(sorted[i].size / 1024));
         consoleUpdate(NULL);
-        Result rc = load_one_nso(nup, &sorted[i], i, &set->mods[i]);
-        if (R_FAILED(rc))
+        Result rc = load_one_nso_ex(nup, &sorted[i], i, &set->mods[i], map_executable);
+        if (R_FAILED(rc)) {
+            if (!map_executable)
+                elfUnloadAuditModules(set);
             return rc;
+        }
         set->count = i + 1;
     }
     return 0;
+}
+
+Result elfLoadNupModules(ModuleSet* set, NupArchive* nup,
+                         const NupFileInfo* exefs, u32 exefs_count) {
+    return load_nup_modules_ex(set, nup, exefs, exefs_count, true);
+}
+
+Result elfLoadNupModulesForAudit(ModuleSet* set, NupArchive* nup,
+                                 const NupFileInfo* exefs, u32 exefs_count) {
+    return load_nup_modules_ex(set, nup, exefs, exefs_count, false);
+}
+
+void elfUnloadAuditModules(ModuleSet* set) {
+    if (!set)
+        return;
+    for (u32 m = 0; m < set->count; m++) {
+        LoadedModule* mod = &set->mods[m];
+        if (!mod->is_compat) {
+            free(mod->src_buf);
+            free(mod->bss_buf);
+        }
+    }
+    memset(set, 0, sizeof(*set));
 }
 
 static u32 sysv_elf_hash(const char* name) {
@@ -695,12 +737,15 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
         const Elf64_Sym* sym = &syms[sym_idx];
         const char* name = (sym->st_name < mod->strsz) ? (mod->strtab + sym->st_name) : "";
         u64 addr = 0;
+        bool was_hooked = false;
         if (name[0]) {
             const bool is_c1_undef = mod->is_compat && strcmp(mod->name, "compat1") == 0 && sym->st_shndx == 0;
             if (strcmp(name, "_ZN2nn2ro25LookupNextSymbolForCompatEPmPKc") == 0) {
                 addr = (u64)(uintptr_t)hooksLookupNextForCompat;
+                was_hooked = true;
             } else if (strcmp(name, "_ZN2nn2ro12ProtectRelroEPKvS2_S2_S2_S2_") == 0) {
                 addr = (u64)(uintptr_t)stub_protect_relro;
+                was_hooked = true;
             } else {
                 addr = is_c1_undef ? elfFindSymbolSkipCompat1(set, name) : elfFindSymbol(set, name);
                 if (!addr) {
@@ -721,8 +766,16 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
                 if (hook_fn) {
                     const u64 real_for_hook = set->has_compat ? elfFindSymbolSkipCompat1(set, name) : addr;
                     const u64 hooked = hook_fn(name, real_for_hook ? real_for_hook : addr);
-                    if (hooked)
+                    if (hooked) {
                         addr = hooked;
+                        was_hooked = true;
+                    }
+                }
+                if (type == R_AARCH64_JUMP_SLOT && !was_hooked && addr &&
+                    nupTraceIsEnabled() && strcmp(mod->name, "sdk") != 0) {
+                    const u64 tramp = nupTraceWrapPlt(mod->name, name, addr);
+                    if (tramp)
+                        addr = tramp;
                 }
             }
         } else if (sym->st_shndx != 0) {
@@ -909,9 +962,195 @@ Result elfRelocateAll(ModuleSet* set, SymbolHookFn hook_fn, u32* out_unresolved)
     if ((p = (void**)(uintptr_t)elfFindSymbol(set, "_ZN2nn2ro6detail34g_pLookupGlobalAutoFunctionPointerE"))) *p = (void*)rtld_auto_lookup;
     if ((p = (void**)(uintptr_t)elfFindSymbol(set, "_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE"))) *p = &g_manual_lookup;
     if ((p = (void**)(uintptr_t)elfFindSymbol(set, "_ZN2nn2ro6detail14g_pRoDebugFlagE"))) *p = &g_ro_debug_flag;
+    if (nupTraceIsEnabled()) {
+        nupTraceSetModules(set);
+        nupLogf("[trace] PLT tracer armed: %u / %u trampoline slots used\n",
+                nupTraceSlotCount(), NUP_TRACE_MAX_SLOTS);
+    }
     if (out_unresolved)
         *out_unresolved = unresolved;
     return 0;
+}
+
+static bool audit_is_fs_aoc(const char* name) {
+    return (strncmp(name, "_ZN2nn2fs", 9) == 0 ||
+            strncmp(name, "_ZNK2nn2fs", 10) == 0 ||
+            strncmp(name, "_ZN2nn3aoc", 10) == 0 ||
+            strncmp(name, "_ZNK2nn3aoc", 11) == 0);
+}
+
+static bool audit_is_sys_api(const char* name) {
+    static const char* const pfx[] = {
+        "_ZN2nn2oe", "_ZNK2nn2oe",
+        "_ZN2nn2am", "_ZNK2nn2am",
+        "_ZN2nn2sm", "_ZNK2nn2sm",
+        "_ZN2nn2os", "_ZNK2nn2os",
+        "_ZN2nn3mem", "_ZNK2nn3mem",
+        "_ZN2nn4lmem", "_ZNK2nn4lmem",
+        "_ZN2nn2vi", "_ZNK2nn2vi",
+        "_ZN2nn2nv", "_ZNK2nn2nv",
+        "_ZN2nn7account", "_ZNK2nn7account",
+        "_ZN2nn4init", "_ZN2nn4diag",
+        "_ZN2nn6compat", "_ZN2nn2ro",
+        "nninit", "nnos", "nvn", "pfnc_nvn",
+        NULL
+    };
+    for (int i = 0; pfx[i]; i++) {
+        if (strncmp(name, pfx[i], strlen(pfx[i])) == 0)
+            return true;
+    }
+    return false;
+}
+
+static u64 audit_resolve_sym(const ModuleSet* set, const LoadedModule* mod,
+                             const Elf64_Sym* sym, const char* name) {
+    if (!name || !name[0])
+        return sym->st_shndx ? (mod->nso_base + sym->st_value) : 0;
+    if (strcmp(name, "_ZN2nn2ro25LookupNextSymbolForCompatEPmPKc") == 0 ||
+        strcmp(name, "_ZN2nn2ro12ProtectRelroEPKvS2_S2_S2_S2_") == 0 ||
+        strcmp(name, "__nnDetailNintendoSdkRuntimeObjectFile") == 0 ||
+        strcmp(name, "_ZN2nn5album14g_LibraryStateE") == 0 ||
+        strcmp(name, "_ZN2nn6socket13IsInitializedEv") == 0)
+        return 1;
+    const bool is_c1_undef = mod->is_compat && strcmp(mod->name, "compat1") == 0 && sym->st_shndx == 0;
+    u64 addr = is_c1_undef ? elfFindSymbolSkipCompat1(set, name) : elfFindSymbol(set, name);
+    if (!addr) {
+        if (strcmp(name, "_ZN2nn2os18SdkAllocateTlsSlotEPNS0_7TlsSlotEPFvmE") == 0)
+            addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE");
+        else if (strcmp(name, "nnosLockMutex") == 0)
+            addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE");
+        else if (strcmp(name, "nnosUnlockMutex") == 0)
+            addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE");
+        else if (strcmp(name, "nnosInitializeMutex") == 0)
+            addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi");
+    }
+    return addr;
+}
+
+static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
+                                const Elf64_Rela* table, u64 bytes,
+                                u8* seen_bits, SymbolHookFn hook_fn,
+                                int pass, ElfAuditSummary* sum) {
+    if (!table || bytes == 0 || !mod->symtab || !mod->strtab)
+        return;
+    const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
+    const u64 count = bytes / sizeof(Elf64_Rela);
+    for (u64 i = 0; i < count; i++) {
+        const u32 type = ELF64_R_TYPE(table[i].r_info);
+        if (type != R_AARCH64_ABS64 && type != R_AARCH64_GLOB_DAT &&
+            type != R_AARCH64_JUMP_SLOT)
+            continue;
+        const u32 sidx = ELF64_R_SYM(table[i].r_info);
+        if (sidx >= mod->sym_count)
+            continue;
+        if (seen_bits && (seen_bits[sidx >> 3] & (1u << (sidx & 7))))
+            continue;
+        if (seen_bits)
+            seen_bits[sidx >> 3] |= (u8)(1u << (sidx & 7));
+
+        const Elf64_Sym* sym = &syms[sidx];
+        const char* name = (sym->st_name < mod->strsz) ? (mod->strtab + sym->st_name) : "";
+        if (!name[0])
+            continue;
+
+        const u64 resolved = audit_resolve_sym(set, mod, sym, name);
+        const bool is_hooked = hook_fn && (hook_fn(name, 0) != 0);
+
+        if (pass == 0) {
+            if (!resolved && !is_hooked && ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+                sum->unresolved_count++;
+                nupLogBufferedf("  [UNRESOLVED] %-8s %s\n", mod->name, name);
+            }
+        } else if (pass == 1) {
+            if (strcmp(mod->name, "sdk") != 0 && !is_hooked && audit_is_fs_aoc(name)) {
+                sum->unhooked_fs_aoc++;
+                nupLogBufferedf("  [UNHOOKED-FS] %-8s %s\n", mod->name, name);
+            }
+        } else if (pass == 2) {
+            if (strcmp(mod->name, "sdk") != 0 && !is_hooked && !audit_is_fs_aoc(name) && audit_is_sys_api(name)) {
+                sum->unhooked_sys++;
+                nupLogBufferedf("  [UNHOOKED-SYS] %-8s %s\n", mod->name, name);
+            }
+        } else if (pass == 3) {
+            if (strcmp(mod->name, "sdk") != 0 && is_hooked) {
+                sum->hooked_count++;
+                nupLogBufferedf("  [HOOKED] %-8s %s\n", mod->name, name);
+            }
+        }
+    }
+}
+
+void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
+                       ElfAuditSummary* out_summary) {
+    ElfAuditSummary sum;
+    memset(&sum, 0, sizeof(sum));
+    if (!set)
+        return;
+
+    sum.module_count = set->count;
+    sum.has_compat = set->has_compat;
+
+    nupLogBufferedf("\n--- MODULES (%u, compat=%d) ---\n", set->count, set->has_compat ? 1 : 0);
+    for (u32 m = 0; m < set->count; m++) {
+        const LoadedModule* mod = &set->mods[m];
+        nupLogBufferedf("  %-8s size=0x%llx syms=%u rela=%llu jmprel=%llu init_arr=%llu%s\n",
+                        mod->name, (unsigned long long)mod->total_size, mod->sym_count,
+                        (unsigned long long)(mod->relasz / sizeof(Elf64_Rela)),
+                        (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
+                        (unsigned long long)(mod->init_arraysz / sizeof(u64)),
+                        mod->is_compat ? " [COMPAT]" : "");
+    }
+
+    const u64 start5 = elfFindSymbolSkipCompat1(set, "_ZN2nn4init5StartEmmPFvvES2_S2_");
+    const u64 start4 = elfFindSymbolSkipCompat1(set, "_ZN2nn4init5StartEmmPFvvES2_");
+    const u64 startup = elfFindSymbol(set, "nninitStartup");
+    const u64 main_sym = elfFindSymbol(set, "nnMain");
+    const u64 init_sdk = elfFindSymbolSkipCompat1(set, "nninitInitializeSdkModule");
+    const u64 os_init = elfFindSymbolSkipCompat1(set, "nnosInitialize");
+    const u64 set_ex = elfFindSymbol(set, "_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_");
+    const u64 reg_obs = elfFindSymbol(set, "_ZN2nn4diag21RegisterAbortObserverEPNS0_19AbortObserverHolderE");
+    const u64 std_alloc2 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocator10InitializeEPvm");
+    const u64 std_alloc3 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocator10InitializeEPvmb");
+    snprintf(sum.entry_kind, sizeof(sum.entry_kind), "%s",
+             start5 ? "5arg" : (start4 ? "4arg" : "manual"));
+
+    nupLogBufferedf("\n--- ENTRY & RUNTIME SYMBOLS (entry=%s) ---\n", sum.entry_kind);
+    nupLogBufferedf("  nn::init::Start(5arg)=%d  (4arg)=%d  nninitStartup=%d  nnMain=%d\n",
+                    start5 ? 1 : 0, start4 ? 1 : 0, startup ? 1 : 0, main_sym ? 1 : 0);
+    nupLogBufferedf("  nninitInitializeSdkModule=%d  nnosInitialize=%d  SetUserExceptionHandler=%d  AbortObserver=%d\n",
+                    init_sdk ? 1 : 0, os_init ? 1 : 0, set_ex ? 1 : 0, reg_obs ? 1 : 0);
+    nupLogBufferedf("  StandardAllocator::Initialize(2arg)=%d  (3arg)=%d\n",
+                    std_alloc2 ? 1 : 0, std_alloc3 ? 1 : 0);
+
+    static const char* const pass_titles[4] = {
+        "UNRESOLVED NON-WEAK SYMBOLS (ALL)",
+        "UNHOOKED nn::fs / nn::aoc IMPORTS (candidates to hook)",
+        "UNHOOKED OS / MEM / OE / AM / VI / NV / SM / ACC / INIT IMPORTS",
+        "MATCHED HOOKED IMPORTS"
+    };
+    for (int pass = 0; pass < 4; pass++) {
+        nupLogBufferedf("\n--- %s ---\n", pass_titles[pass]);
+        for (u32 m = 0; m < set->count; m++) {
+            const LoadedModule* mod = &set->mods[m];
+            const size_t bits_sz = ((size_t)mod->sym_count + 7u) / 8u;
+            u8* seen = bits_sz ? (u8*)calloc(1, bits_sz) : NULL;
+            audit_collect_table(set, mod, (const Elf64_Rela*)mod->jmprel, mod->pltrelsz,
+                                seen, hook_fn, pass, &sum);
+            audit_collect_table(set, mod, (const Elf64_Rela*)mod->rela, mod->relasz,
+                                seen, hook_fn, pass, &sum);
+            free(seen);
+        }
+    }
+
+    nupLogBufferedf("\n--- AUDIT SUMMARY ---\n");
+    nupLogBufferedf("  modules=%u compat=%d entry=%s unresolved=%u hooked=%u unhooked_fs_aoc=%u unhooked_sys=%u\n",
+                    sum.module_count, sum.has_compat ? 1 : 0, sum.entry_kind,
+                    sum.unresolved_count, sum.hooked_count,
+                    sum.unhooked_fs_aoc, sum.unhooked_sys);
+    nupLogFlush();
+
+    if (out_summary)
+        *out_summary = sum;
 }
 
 const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off) {
