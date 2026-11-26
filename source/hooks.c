@@ -2324,6 +2324,7 @@ static void (*real_nvnQueueSubmitCommands)(void*, int, const u64*) = NULL;
 static void (*real_nvnQueueFinish)(void*) = NULL;
 static int (*real_nvnQueueGetError)(void*, void*) = NULL;
 static u8 (*real_nvnProgramSetShaders)(void*, int, const void*) = NULL;
+static u8 (*real_nvnProgramSetShadersExt)(void*, int, const void*) = NULL;
 static void* g_last_nvn_queue = NULL;
 static u32 g_nvn_gpa_logs = 0;
 static u32 g_nvn_mempool_calls = 0;
@@ -2405,26 +2406,80 @@ static u8 wrap_nvnProgramSetShaders(void* prog, int count, const void* stageData
     return ok;
 }
 
+static u8 wrap_nvnProgramSetShadersExt(void* prog, int count, const void* stageData) {
+    const u8 ok = real_nvnProgramSetShadersExt ? real_nvnProgramSetShadersExt(prog, count, stageData) : 0;
+    if (ok) {
+        __atomic_add_fetch(&g_nvn_shader_ok, 1u, __ATOMIC_RELAXED);
+    } else {
+        const u32 f = __atomic_add_fetch(&g_nvn_shader_fail, 1u, __ATOMIC_RELAXED);
+        if (f <= 16)
+            nupLogf("[nvn] nvnProgramSetShadersExt #%u(prog=%p, count=%d, data=%p) -> FAILED\n",
+                    f, prog, count, stageData);
+    }
+    return ok;
+}
+
+static bool hooks_is_readable(u64 addr, u64 sz) {
+    if (!addr || addr < 0x10000ULL) return false;
+    MemoryInfo mi = {};
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) return false;
+    return (mi.perm & Perm_R) && (addr + sz <= mi.addr + mi.size);
+}
+
 static void wrap_nvnQueueSubmitCommands(void* q, int numCommands, const u64* handles) {
     const u32 s = __atomic_add_fetch(&g_nvn_submit_calls, 1u, __ATOMIC_RELAXED);
-    if (real_nvnQueueSubmitCommands) real_nvnQueueSubmitCommands(q, numCommands, handles);
-    if (s <= 48 && !g_nvn_err_logged && real_nvnQueueFinish && real_nvnQueueGetError) {
-        real_nvnQueueFinish(q);
-        u64 info[8] = {};
-        const int err = real_nvnQueueGetError(q, info);
-        if (err != 0 || s <= 12) {
-            nupLogf("[nvn] submit #%u(q=%p, n=%d, h0=0x%llx) finish -> err=%d (shaders=%u/%u pools=%u dev_flags=0x%x)\n",
-                    s, q, numCommands, (unsigned long long)(numCommands > 0 && handles ? handles[0] : 0ULL),
-                    err, g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls, g_nvn_dev_flags);
+    if (s <= 16 && !g_nvn_err_logged && handles && numCommands > 0 &&
+        real_nvnQueueSubmitCommands && real_nvnQueueFinish && real_nvnQueueGetError) {
+        nupLogf("[nvn] submit #%u ENTER (q=%p, n=%d, shaders=%u/%u pools=%u)\n",
+                s, q, numCommands, g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
+        nupLogFlush();
+        for (int i = 0; i < numCommands; i++) {
+            real_nvnQueueSubmitCommands(q, 1, &handles[i]);
+            real_nvnQueueFinish(q);
+            u64 info[8] = {};
+            const int err = real_nvnQueueGetError(q, info);
             if (err != 0) {
                 g_nvn_err_logged = 1;
-                nupLogf("      err_info: %016llx %016llx %016llx %016llx\n",
-                        (unsigned long long)info[0], (unsigned long long)info[1],
-                        (unsigned long long)info[2], (unsigned long long)info[3]);
+                const u64 h = handles[i];
+                const u64 ctrl = h & 0x0000FFFFFFFFFFFFULL;
+                nupLogf("!!! [nvn] FAULT at submit #%u cmd[%d/%d] handle=0x%llx -> err=%d (shaders=%u/%u pools=%u)\n",
+                        s, i, numCommands, (unsigned long long)h, err,
+                        g_nvn_shader_ok, g_nvn_shader_fail, g_nvn_mempool_calls);
+                if ((ctrl & 7ULL) == 0 && hooks_is_readable(ctrl, 0x80)) {
+                    const u64* cq = (const u64*)(uintptr_t)ctrl;
+                    for (u32 k = 0; k < 16; k += 4) {
+                        nupLogf("    ctrl+%02x: %016llx %016llx %016llx %016llx\n",
+                                k * 8,
+                                (unsigned long long)cq[k], (unsigned long long)cq[k + 1],
+                                (unsigned long long)cq[k + 2], (unsigned long long)cq[k + 3]);
+                    }
+                    // Also dump Maxwell pushbuffer words if any ctrl qword points to readable command memory
+                    for (u32 k = 0; k < 8; k++) {
+                        const u64 cand = cq[k];
+                        if (cand && cand != ctrl && (cand & 3ULL) == 0 &&
+                            cand > 0x10000000ULL && hooks_is_readable(cand, 0x80)) {
+                            const u32* cw = (const u32*)(uintptr_t)cand;
+                            nupLogf("    [cmdbuf @ ctrl+%02x -> 0x%llx (32 words)]:\n", k * 8, (unsigned long long)cand);
+                            for (u32 j = 0; j < 32; j += 4) {
+                                nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                        j * 4, cw[j], cw[j + 1], cw[j + 2], cw[j + 3]);
+                            }
+                            break;
+                        }
+                    }
+                }
                 nupLogFlush();
+                // Submit remaining handles if any without finishing one-by-one
+                if (i + 1 < numCommands)
+                    real_nvnQueueSubmitCommands(q, numCommands - (i + 1), &handles[i + 1]);
+                return;
             }
         }
+        nupLogf("[nvn] submit #%u ALL %d cmd(s) OK!\n", s, numCommands);
+        return;
     }
+    if (real_nvnQueueSubmitCommands) real_nvnQueueSubmitCommands(q, numCommands, handles);
 }
 
 static void wrap_nvnQueuePresentTexture(void* q, void* w, int idx) {
@@ -2484,6 +2539,10 @@ static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
             if (strcmp(name, "nvnProgramSetShaders") == 0) {
                 real_nvnProgramSetShaders = (u8 (*)(void*, int, const void*))fn;
                 return (void*)wrap_nvnProgramSetShaders;
+            }
+            if (strcmp(name, "nvnProgramSetShadersExt") == 0) {
+                real_nvnProgramSetShadersExt = (u8 (*)(void*, int, const void*))fn;
+                return (void*)wrap_nvnProgramSetShadersExt;
             }
             const u64 tramp = nupTraceWrapDynamicProc("nvn_gpa", name, (u64)(uintptr_t)fn);
             if (tramp)
