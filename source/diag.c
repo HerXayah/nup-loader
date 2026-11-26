@@ -443,6 +443,12 @@ void nupDiagDumpAbortContext(u64 caller) {
                                             (unsigned long long)oq[k], (unsigned long long)oq[k + 1],
                                             (unsigned long long)oq[k + 2], (unsigned long long)oq[k + 3]);
                                 }
+                                for (u32 k = 0; k < 8; k++) {
+                                    size_t slen = 0;
+                                    if (is_in_module_rodata(oq[k]) && is_printable_str_at(oq[k], 2, &slen)) {
+                                        nupLogf("    obj+%02x str: '%.96s'\n", k * 8, (const char*)(uintptr_t)oq[k]);
+                                    }
+                                }
                                 const u64 vt = nupStripCodePac(oq[0]);
                                 if (vt && (vt & 7ULL) == 0 && is_readable_addr(vt, 0x30)) {
                                     const u64* vq = (const u64*)(uintptr_t)vt;
@@ -460,7 +466,73 @@ void nupDiagDumpAbortContext(u64 caller) {
                                             nupLogf("      +%02x: %08x %08x %08x %08x\n",
                                                     k * 4, fi[k], fi[k + 1], fi[k + 2], fi[k + 3]);
                                         }
+                                        // Follow any tail-call B #imm26 inside vtable[2] (skip short thunk hops)
+                                        for (u32 k = 4; k < 32; k++) {
+                                            if ((fi[k] & 0xFC000000u) == 0x14000000u) {
+                                                s64 boff = (s64)(s32)(fi[k] << 6) >> 4;
+                                                const u64 btgt = fn2 + (u64)k * 4ULL + (u64)boff;
+                                                if ((btgt & 3ULL) == 0 && is_readable_addr(btgt, 0x80)) {
+                                                    const u32* bi = (const u32*)(uintptr_t)btgt;
+                                                    char bts[64];
+                                                    nupFmtAddrMod(btgt, bts, sizeof(bts));
+                                                    nupLogf("    [vtable[2]-tail @ %s (32 insns)]:\n", bts);
+                                                    for (u32 j = 0; j < 32; j += 4) {
+                                                        nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                                                j * 4, bi[j], bi[j + 1], bi[j + 2], bi[j + 3]);
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
                                     }
+                                }
+                                // Follow one delegation hop to any embedded backing object with a vtable
+                                for (u32 k = 1; k < 8; k++) {
+                                    const u64 sub = oq[k];
+                                    if (!sub || sub == obj || (sub & 7ULL) != 0 || is_in_module_rodata(sub))
+                                        continue;
+                                    if (!is_readable_addr(sub, 0xC0))
+                                        continue;
+                                    const u64* sq = (const u64*)(uintptr_t)sub;
+                                    const u64 svt = nupStripCodePac(sq[0]);
+                                    if (!svt || (svt & 7ULL) != 0 || !is_readable_addr(svt, 0xA0))
+                                        continue;
+                                    const u64* svq = (const u64*)(uintptr_t)svt;
+                                    const u64 sfn2 = nupStripCodePac(svq[2]);
+                                    bool sfn2_is_code = false;
+                                    for (u32 m = 0; m < g_mods.count; m++) {
+                                        const LoadedModule* mod = &g_mods.mods[m];
+                                        if (mod->rodata_off && sfn2 >= mod->nso_base && sfn2 < mod->nso_base + mod->rodata_off) {
+                                            sfn2_is_code = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!sfn2_is_code || (sfn2 & 3ULL) != 0 || !is_readable_addr(sfn2, 0xC0))
+                                        continue;
+                                    char svts[64], sf2s[64];
+                                    nupFmtAddrMod(svt, svts, sizeof(svts));
+                                    nupFmtAddrMod(sfn2, sf2s, sizeof(sf2s));
+                                    nupLogf("  [abort-subobj obj+%02x -> sub=0x%llx vtable=%s vtable[2]=%s]\n",
+                                            k * 8, (unsigned long long)sub, svts, sf2s);
+                                    for (u32 j = 0; j < 24; j += 4) {
+                                        nupLogf("    sub+%02x: %016llx %016llx %016llx %016llx\n",
+                                                j * 8,
+                                                (unsigned long long)sq[j], (unsigned long long)sq[j + 1],
+                                                (unsigned long long)sq[j + 2], (unsigned long long)sq[j + 3]);
+                                    }
+                                    for (u32 j = 0; j < 12; j++) {
+                                        size_t slen = 0;
+                                        if (is_in_module_rodata(sq[j]) && is_printable_str_at(sq[j], 2, &slen)) {
+                                            nupLogf("    sub+%02x str: '%.96s'\n", j * 8, (const char*)(uintptr_t)sq[j]);
+                                        }
+                                    }
+                                    const u32* sfi = (const u32*)(uintptr_t)sfn2;
+                                    nupLogf("    [sub->vtable[2] @ %s (48 insns)]:\n", sf2s);
+                                    for (u32 j = 0; j < 48; j += 4) {
+                                        nupLogf("      +%02x: %08x %08x %08x %08x\n",
+                                                j * 4, sfi[j], sfi[j + 1], sfi[j + 2], sfi[j + 3]);
+                                    }
+                                    break;
                                 }
                             }
                             inspected_obj = true;
