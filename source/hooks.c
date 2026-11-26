@@ -2117,10 +2117,10 @@ static void hook_QueryMemoryInfo(void* out) {
             if (g_compat_heap_marked || !g_caps.has_compat2) {
                 // Report retail Switch 1 application RAM ceiling (3,285 MiB) and base
                 // game-visible free memory directly on actual remaining physical RAM
-                // (leaving 96 MiB headroom for Horizon/NVN/threads), so donor NSOs and
-                // libnx staging overhead don't double-starve Switch 1 games.
+                // minus 256 MiB headroom (covers transient ~100 MiB sub-heap carve-outs
+                // during nninitStartup plus Horizon/NVN/thread allocations).
                 const u64 sw1_avail = (orig_avail < 0xCD500000ULL) ? orig_avail : 0xCD500000ULL;
-                const u64 safe_free = (real_free > 0x6000000ULL) ? (real_free - 0x6000000ULL) : 0ULL;
+                const u64 safe_free = (real_free > 0x10000000ULL) ? (real_free - 0x10000000ULL) : 0ULL;
                 const u64 max_game_free = (sw1_avail > 0x8000000ULL) ? (sw1_avail - 0x8000000ULL) : sw1_avail;
                 const u64 game_free = (safe_free < max_game_free) ? safe_free : max_game_free;
                 q[0] = sw1_avail;
@@ -2129,7 +2129,7 @@ static void hook_QueryMemoryInfo(void* out) {
                 // Before compat2 finishes reserving its hidden 3 GiB heap, keep the
                 // conservative 3 GiB view so compat2 initialization sees the expected cap.
                 q[0] = 0xC0000000ULL;
-                const u64 safe_free = (real_free > 0x6000000ULL) ? (real_free - 0x6000000ULL) : 0ULL;
+                const u64 safe_free = (real_free > 0x10000000ULL) ? (real_free - 0x10000000ULL) : 0ULL;
                 if (q[1] >= q[0] || (q[0] - q[1]) > safe_free)
                     q[1] = (q[0] > safe_free) ? (q[0] - safe_free) : 0;
             }

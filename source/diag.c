@@ -315,6 +315,16 @@ void nupDiagDumpAbortContext(u64 caller) {
     nupLogf("  [abort-ctx tid=%llu] caller_pc=0x%llx tpidr_el0=0x%llx tpidrro_el0=0x%llx\n",
             (unsigned long long)tid, (unsigned long long)(caller >= 4 ? caller - 4 : caller),
             (unsigned long long)tpidr, (unsigned long long)tpidrro);
+    if (tpidr && (tpidr & 7ULL) == 0 && is_readable_addr(tpidr, 0xC0)) {
+        const u64* tp = (const u64*)(uintptr_t)tpidr;
+        nupLogf("  [abort-tls @ tpidr_el0=0x%llx (0x00..0xc0)]:\n", (unsigned long long)tpidr);
+        for (u32 i = 0; i < 24; i += 4) {
+            nupLogf("    +%02x: %016llx %016llx %016llx %016llx\n",
+                    i * 8,
+                    (unsigned long long)tp[i], (unsigned long long)tp[i + 1],
+                    (unsigned long long)tp[i + 2], (unsigned long long)tp[i + 3]);
+        }
+    }
 
     // 1. Dump 48 AArch64 instructions preceding abort() and decode BL/PLT targets & ADRP+ADD rodata strings
     const u64 dump_bytes = 0xC0;
@@ -332,7 +342,8 @@ void nupDiagDumpAbortContext(u64 caller) {
         // Track ADRP base pages per register x0..x30 to resolve ADRP+ADD strings
         u64 adrp_page[32] = {};
         bool adrp_valid[32] = {};
-        u64 last_internal_bl = 0;
+        u64 internal_bls[4] = {};
+        u32 internal_bl_count = 0;
         for (u32 i = 0; i < nins; i++) {
             const u32 w = ins[i];
             const u64 pc = base_pc + (u64)i * 4ULL;
@@ -377,17 +388,24 @@ void nupDiagDumpAbortContext(u64 caller) {
                 } else {
                     nupLogf("  [abort-bl @ %s]: BL %s (%s+0x%llx)\n",
                             pcs, ts, sym ? sym : "?", (unsigned long long)(sym ? soff : 0));
-                    last_internal_bl = tgt;
+                    bool dup = false;
+                    for (u32 k = 0; k < internal_bl_count; k++)
+                        if (internal_bls[k] == tgt) { dup = true; break; }
+                    if (!dup && internal_bl_count < 4)
+                        internal_bls[internal_bl_count++] = tgt;
                 }
             }
         }
-        // Also dump the entry of the last internal BL target before abort() (e.g. failing helper)
-        if (last_internal_bl && (last_internal_bl & 3ULL) == 0 && is_readable_addr(last_internal_bl, 0x80)) {
-            const u32* cal = (const u32*)(uintptr_t)last_internal_bl;
+        // Dump up to 48 instructions of each unique internal BL target before abort()
+        for (u32 b = 0; b < internal_bl_count; b++) {
+            const u64 tgt = internal_bls[b];
+            if (!tgt || (tgt & 3ULL) != 0 || !is_readable_addr(tgt, 0xC0))
+                continue;
+            const u32* cal = (const u32*)(uintptr_t)tgt;
             char ls[64];
-            nupFmtAddrMod(last_internal_bl, ls, sizeof(ls));
-            nupLogf("  [abort-callee @ %s (32 insns)]:\n", ls);
-            for (u32 i = 0; i < 32; i += 4) {
+            nupFmtAddrMod(tgt, ls, sizeof(ls));
+            nupLogf("  [abort-callee #%u @ %s (48 insns)]:\n", b, ls);
+            for (u32 i = 0; i < 48; i += 4) {
                 nupLogf("    +%02x: %08x %08x %08x %08x\n",
                         i * 4, cal[i], cal[i + 1], cal[i + 2], cal[i + 3]);
             }
