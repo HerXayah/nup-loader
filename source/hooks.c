@@ -160,7 +160,6 @@ static void (*real_WaitSystemEvent)(void*) = NULL;
 static int (*real_GetCurrentFocusState)(void) = NULL;
 static void (*real_SetFocusHandlingMode)(int) = NULL;
 static void (*real_nninitStartup)(void) = NULL;
-static void (*real_nnMain)(void) = NULL;
 static void (*real_AbortImpl0)(void) = NULL;
 static void (*real_AbortImplRes)(const u32*) = NULL;
 static void (*real_AbortRes)(const u32*) = NULL;
@@ -2712,14 +2711,6 @@ static void hook_GetProcessNamePointer(const char** out_name, u64* out_len) {
     if (out_len) *out_len = strlen(name);
 }
 
-static void hook_nnMain(void) {
-    log_used_mem("before nnMain");
-    nupOnBeforeNnMain();
-    nupLogf("[6/6] entering nnMain @ %p\n", (void*)real_nnMain);
-    if (real_nnMain) real_nnMain();
-    nupLogf("[6/6] nnMain returned!\n");
-}
-
 static void hook_AbortImpl0(void) {
     const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
     nupLogBacktrace("nn::diag::detail::AbortImpl()", caller, 0, 0);
@@ -2989,7 +2980,9 @@ static const HookProviderEntry g_hook_registry[] = {
     PROV_WRAP("_ZN2nn2oe20GetCurrentFocusStateEv", hook_GetCurrentFocusState, real_GetCurrentFocusState, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", hook_SetFocusHandlingMode, real_SetFocusHandlingMode, HOOK_PROV_SVC, false),
     PROV_WRAP("nninitStartup", hook_nninitStartup, real_nninitStartup, HOOK_PROV_SVC, false),
-    PROV_WRAP("nnMain", hook_nnMain, real_nnMain, HOOK_PROV_SVC, false),
+    // NOTE: Never hook nnMain — sdk's __nnmusl_init_dso checks GOT[nnMain] against
+    // [text_start, text_end) to recognize the main DSO and initialize ELF PT_TLS +
+    // nnmuslThreadPointerInitializer. Redirecting nnMain breaks C++ thread_local TLS!
     PROV_WRAP("_ZN2nn2os11GetHostArgcEv", hook_GetHostArgc, real_GetHostArgc, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn2os11GetHostArgvEv", hook_GetHostArgv, real_GetHostArgv, HOOK_PROV_SVC, false),
     PROV_ONLY("_ZN2nn4diag6detail21GetProcessNamePointerEPPKcPm", hook_GetProcessNamePointer, HOOK_PROV_SVC, true),

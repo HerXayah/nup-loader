@@ -17,7 +17,7 @@
 #include "trace.h"
 #include "ui.h"
 
-#define NUP_BUILD_TAG "0325-cap13"
+#define NUP_BUILD_TAG "0325-cap14"
 
 // Keep libnx's own heap compact (256 MiB: enough for NUP TOC + NSO staging)
 // so ~5.8 GiB remains free for the launched game's heap and GPU/virtual memory.
@@ -40,6 +40,7 @@ static void cb_notify_exception_ready(void) {
 static void cb_call_initializers(void) {
     nupLogf("[6/6] nn::init::Start -> callInitializers\n");
     elfRunInitArrays(&g_mods, nupDiagRegisterAbortObservers);
+    nupOnBeforeNnMain();
     nupLogf("[6/6] callInitializers done -> entering nnMain\n");
 }
 
@@ -423,7 +424,7 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
             ((void (*)(void))(uintptr_t)fn)();
         }
         elfRunInitArrays(&g_mods, nupDiagRegisterAbortObservers);
-        nupDiagRegisterExceptionHandler(true);
+        nupOnBeforeNnMain();
         nupLogf("[6/6] calling nnMain @ %016llx\n", (unsigned long long)main_addr);
         ((void (*)(void))(uintptr_t)main_addr)();
     }
