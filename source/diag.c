@@ -170,9 +170,11 @@ static void on_sdk_user_exception(void* info) {
 }
 
 static void dump_abort_info(const char* tag, const void* info) {
+    u64 tid = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
     char lr_s[64];
     nupFmtAddrMod((u64)(uintptr_t)__builtin_return_address(0), lr_s, sizeof(lr_s));
-    nupLogf("!!! %s(info=%p) lr=%s\n", tag, info, lr_s);
+    nupLogf("!!! %s(info=%p) tid=%llu lr=%s\n", tag, info, (unsigned long long)tid, lr_s);
     if (info) {
         const u64* q = (const u64*)info;
         for (int i = 0; i < 10; i++) {
@@ -180,11 +182,17 @@ static void dump_abort_info(const char* tag, const void* info) {
             nupFmtAddrMod(q[i], sym_s, sizeof(sym_s));
             nupLogf("  [%d] = 0x%016llx (%s)\n", i, (unsigned long long)q[i], sym_s);
         }
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 10; i++) {
             if (is_readable_addr(q[i], 4)) {
                 const char* s = (const char*)(uintptr_t)q[i];
                 if (s[0] >= 0x20 && s[0] < 0x7f && s[1] >= 0x20 && s[1] < 0x7f) {
                     nupLogf("  str[%d] = '%.120s'\n", i, s);
+                } else if (i == 0 || i == 4 || i == 5) {
+                    const u32 rv = *(const u32*)(uintptr_t)q[i];
+                    if (rv != 0 && R_MODULE(rv) > 0 && R_MODULE(rv) < 512) {
+                        nupLogf("  res_ptr[%d] -> 0x%x (mod=%u desc=%u)\n",
+                                i, rv, R_MODULE(rv), R_DESCRIPTION(rv));
+                    }
                 }
             }
         }

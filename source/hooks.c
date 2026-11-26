@@ -4,6 +4,8 @@
 #include "log.h"
 #include "trace.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #define MAX_VFS_MOUNTS 32
@@ -161,6 +163,8 @@ static void (*real_nninitStartup)(void) = NULL;
 static void (*real_nnMain)(void) = NULL;
 static void (*real_AbortImpl0)(void) = NULL;
 static void (*real_AbortImplRes)(const u32*) = NULL;
+static void (*real_AbortRes)(const u32*) = NULL;
+static void (*real_VAbortImpl)(const char*, const char*, const char*, int, const u32*, const void*, const char*, void*) = NULL;
 static void (*real_StdTerminate)(void) = NULL;
 static void (*real_AssertFail)(const char*, const char*, int, const char*) = NULL;
 static void (*real_LibcppVerboseAbort)(const char*, ...) = NULL;
@@ -2304,7 +2308,75 @@ static u32 hook_ViCreateLayer(void** out, void* disp) {
 }
 
 static void* (*real_NvnDeviceGetProcAddress)(void*, const char*) = NULL;
+static u8 (*real_nvnDeviceInitialize)(void*, const void*) = NULL;
+static u8 (*real_nvnQueueInitialize)(void*, const void*) = NULL;
+static u8 (*real_nvnWindowInitialize)(void*, const void*) = NULL;
+static u8 (*real_nvnMemoryPoolInitialize)(void*, const void*) = NULL;
+static void (*real_nvnQueuePresentTexture)(void*, void*, int) = NULL;
 static u32 g_nvn_gpa_logs = 0;
+static u32 g_nvn_mempool_calls = 0;
+static u32 g_nvn_present_frames = 0;
+
+static void log_gpu_remote_inline(u64* out_used, u64* out_tot) {
+    u64 u = 0, t = 0;
+    if (R_SUCCEEDED(svcGetInfo(&t, 31, CUR_PROCESS_HANDLE, 0)))
+        svcGetInfo(&u, 32, CUR_PROCESS_HANDLE, 0);
+    if (out_used) *out_used = u;
+    if (out_tot) *out_tot = t;
+}
+
+static u8 wrap_nvnDeviceInitialize(void* dev, const void* builder) {
+    u64 gu = 0, gt = 0;
+    log_gpu_remote_inline(&gu, &gt);
+    nupLogf("[nvn] nvnDeviceInitialize(dev=%p, builder=%p) ENTER (gpu=%llu/%llu MiB)\n",
+            dev, builder, (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+    const u8 ok = real_nvnDeviceInitialize ? real_nvnDeviceInitialize(dev, builder) : 0;
+    log_gpu_remote_inline(&gu, &gt);
+    nupLogf("[nvn] nvnDeviceInitialize(dev=%p) -> %u (gpu=%llu/%llu MiB)\n",
+            dev, (unsigned)ok, (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+    return ok;
+}
+
+static u8 wrap_nvnQueueInitialize(void* q, const void* builder) {
+    nupLogf("[nvn] nvnQueueInitialize(q=%p, builder=%p) ENTER\n", q, builder);
+    const u8 ok = real_nvnQueueInitialize ? real_nvnQueueInitialize(q, builder) : 0;
+    u64 gu = 0, gt = 0;
+    log_gpu_remote_inline(&gu, &gt);
+    nupLogf("[nvn] nvnQueueInitialize(q=%p) -> %u (gpu=%llu/%llu MiB)\n",
+            q, (unsigned)ok, (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+    return ok;
+}
+
+static u8 wrap_nvnWindowInitialize(void* w, const void* builder) {
+    nupLogf("[nvn] nvnWindowInitialize(w=%p, builder=%p) ENTER\n", w, builder);
+    const u8 ok = real_nvnWindowInitialize ? real_nvnWindowInitialize(w, builder) : 0;
+    nupLogf("[nvn] nvnWindowInitialize(w=%p) -> %u\n", w, (unsigned)ok);
+    return ok;
+}
+
+static u8 wrap_nvnMemoryPoolInitialize(void* pool, const void* builder) {
+    const u8 ok = real_nvnMemoryPoolInitialize ? real_nvnMemoryPoolInitialize(pool, builder) : 0;
+    const u32 n = __atomic_add_fetch(&g_nvn_mempool_calls, 1u, __ATOMIC_RELAXED);
+    if (!ok || n <= 16 || (n & (n - 1u)) == 0u) {
+        u64 gu = 0, gt = 0;
+        log_gpu_remote_inline(&gu, &gt);
+        nupLogf("[nvn] nvnMemoryPoolInitialize #%u(pool=%p, builder=%p) -> %u%s (gpu=%llu/%llu MiB)\n",
+                n, pool, builder, (unsigned)ok, ok ? "" : " [FAILED]",
+                (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+    }
+    return ok;
+}
+
+static void wrap_nvnQueuePresentTexture(void* q, void* w, int idx) {
+    const u32 f = __atomic_add_fetch(&g_nvn_present_frames, 1u, __ATOMIC_RELAXED);
+    if (f <= 3 || f == 10 || f == 60 || (f % 300u) == 0u) {
+        u64 gu = 0, gt = 0;
+        log_gpu_remote_inline(&gu, &gt);
+        nupLogf("[nvn] nvnQueuePresentTexture frame #%u (q=%p w=%p idx=%d gpu=%llu/%llu MiB)\n",
+                f, q, w, idx, (unsigned long long)(gu >> 20), (unsigned long long)(gt >> 20));
+    }
+    if (real_nvnQueuePresentTexture) real_nvnQueuePresentTexture(q, w, idx);
+}
 
 static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
     void* fn = real_NvnDeviceGetProcAddress ? real_NvnDeviceGetProcAddress(dev, name) : NULL;
@@ -2314,6 +2386,26 @@ static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
             nupLogBufferedf("  [nvn_gpa #%u] '%s' -> %p\n", g_nvn_gpa_logs, name, fn);
         }
         if (fn) {
+            if (strcmp(name, "nvnDeviceInitialize") == 0) {
+                real_nvnDeviceInitialize = (u8 (*)(void*, const void*))fn;
+                return (void*)wrap_nvnDeviceInitialize;
+            }
+            if (strcmp(name, "nvnQueueInitialize") == 0) {
+                real_nvnQueueInitialize = (u8 (*)(void*, const void*))fn;
+                return (void*)wrap_nvnQueueInitialize;
+            }
+            if (strcmp(name, "nvnWindowInitialize") == 0) {
+                real_nvnWindowInitialize = (u8 (*)(void*, const void*))fn;
+                return (void*)wrap_nvnWindowInitialize;
+            }
+            if (strcmp(name, "nvnMemoryPoolInitialize") == 0) {
+                real_nvnMemoryPoolInitialize = (u8 (*)(void*, const void*))fn;
+                return (void*)wrap_nvnMemoryPoolInitialize;
+            }
+            if (strcmp(name, "nvnQueuePresentTexture") == 0) {
+                real_nvnQueuePresentTexture = (void (*)(void*, void*, int))fn;
+                return (void*)wrap_nvnQueuePresentTexture;
+            }
             const u64 tramp = nupTraceWrapDynamicProc("nvn_gpa", name, (u64)(uintptr_t)fn);
             if (tramp)
                 return (void*)(uintptr_t)tramp;
@@ -2328,6 +2420,8 @@ static void* hook_NvnBootstrapLoader(const char* name) {
     if (nupTraceIsEnabled() && r && name && strcmp(name, "nvnDeviceGetProcAddress") == 0) {
         real_NvnDeviceGetProcAddress = (void* (*)(void*, const char*))r;
         g_nvn_gpa_logs = 0;
+        g_nvn_mempool_calls = 0;
+        g_nvn_present_frames = 0;
         nupLogf("  [trace] proxying nvnDeviceGetProcAddress for runtime NVN tracing\n");
         return (void*)hook_NvnDeviceGetProcAddress;
     }
@@ -2625,11 +2719,80 @@ static void hook_AbortImpl0(void) {
     if (real_AbortImpl0) real_AbortImpl0();
 }
 
+static const char* safe_cstr(const char* p) {
+    if (!p || (u64)(uintptr_t)p < 0x10000ULL)
+        return "<null>";
+    MemoryInfo mi = {};
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)p)) || !(mi.perm & Perm_R))
+        return "<unreadable>";
+    return p[0] ? p : "\"\"";
+}
+
 static void hook_AbortImplRes(const u32* res) {
     const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
-    const u32 val = res ? *res : 0;
+    u32 val = 0;
+    if (res && (u64)(uintptr_t)res >= 0x10000ULL) {
+        MemoryInfo mi = {};
+        u32 pi = 0;
+        if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)res)) && (mi.perm & Perm_R))
+            val = *res;
+    }
+    nupLogf("!!! AbortImpl(Result): val=0x%x (mod=%u desc=%u)\n", val, R_MODULE(val), R_DESCRIPTION(val));
     nupLogBacktrace("nn::diag::detail::AbortImpl(Result)", caller, val, (u64)(uintptr_t)res);
     if (real_AbortImplRes) real_AbortImplRes(res);
+}
+
+static void hook_AbortRes(const u32* res) {
+    const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
+    u32 val = 0;
+    if (res && (u64)(uintptr_t)res >= 0x10000ULL) {
+        MemoryInfo mi = {};
+        u32 pi = 0;
+        if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)res)) && (mi.perm & Perm_R))
+            val = *res;
+    }
+    nupLogf("!!! Abort(Result): val=0x%x (mod=%u desc=%u)\n", val, R_MODULE(val), R_DESCRIPTION(val));
+    nupLogBacktrace("nn::diag::detail::Abort(Result)", caller, val, (u64)(uintptr_t)res);
+    if (real_AbortRes) real_AbortRes(res);
+}
+
+static void hook_VAbortImpl(const char* expr, const char* func, const char* file, int line,
+                            const u32* res, const void* exc, const char* fmt, void* ap_ptr) {
+    const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
+    u64 tid = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+    u32 rval = 0;
+    bool has_res = false;
+    if (res && (u64)(uintptr_t)res >= 0x10000ULL) {
+        MemoryInfo mi = {};
+        u32 pi = 0;
+        if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u64)(uintptr_t)res)) && (mi.perm & Perm_R)) {
+            rval = *res;
+            has_res = true;
+        }
+    }
+    nupLogf("!!! VAbortImpl tid=%llu expr='%.80s' func='%.80s' file='%.80s':%d res=%s(0x%x mod=%u desc=%u) exc=%p fmt='%.80s'\n",
+            (unsigned long long)tid,
+            safe_cstr(expr), safe_cstr(func), safe_cstr(file), line,
+            has_res ? "YES" : "NO", rval, R_MODULE(rval), R_DESCRIPTION(rval),
+            exc, safe_cstr(fmt));
+    if (fmt && (u64)(uintptr_t)fmt >= 0x10000ULL && ap_ptr && (u64)(uintptr_t)ap_ptr >= 0x10000ULL) {
+        MemoryInfo mi1 = {}, mi2 = {};
+        u32 pi = 0;
+        if (R_SUCCEEDED(svcQueryMemory(&mi1, &pi, (u64)(uintptr_t)fmt)) && (mi1.perm & Perm_R) &&
+            R_SUCCEEDED(svcQueryMemory(&mi2, &pi, (u64)(uintptr_t)ap_ptr)) && (mi2.perm & Perm_R) &&
+            fmt[0]) {
+            char msg[256];
+            va_list ap_copy;
+            va_copy(ap_copy, *(va_list*)ap_ptr);
+            _vsnprintf_r(_impure_ptr, msg, sizeof(msg), fmt, ap_copy);
+            va_end(ap_copy);
+            nupLogf("!!! VAbortImpl msg: '%.240s'\n", msg);
+        }
+    }
+    nupLogBacktrace("nn::diag::detail::VAbortImpl", caller, rval, (u64)line);
+    if (real_VAbortImpl) real_VAbortImpl(expr, func, file, line, res, exc, fmt, ap_ptr);
 }
 
 static void hook_StdTerminate(void) {
@@ -2818,6 +2981,8 @@ static const HookProviderEntry g_hook_registry[] = {
     PROV_ONLY("_ZN2nn4diag6detail21GetProcessNamePointerEPPKcPm", hook_GetProcessNamePointer, HOOK_PROV_SVC, true),
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEv", hook_AbortImpl0, real_AbortImpl0, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", hook_AbortImplRes, real_AbortImplRes, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn4diag6detail5AbortEPKNS_6ResultE", hook_AbortRes, real_AbortRes, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn4diag6detail10VAbortImplEPKcS3_S3_iPKNS_6ResultEPKNS_2os17UserExceptionInfoES3_RSt9__va_list", hook_VAbortImpl, real_VAbortImpl, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZSt9terminatev", hook_StdTerminate, real_StdTerminate, HOOK_PROV_SVC, false),
     PROV_WRAP("__assert_fail", hook_AssertFail, real_AssertFail, HOOK_PROV_SVC, false),
     PROV_WRAP("_ZNSt3__122__libcpp_verbose_abortEPKcz", hook_LibcppVerboseAbort, real_LibcppVerboseAbort, HOOK_PROV_SVC, false),
@@ -2890,7 +3055,10 @@ u32 hooksLookupNextForCompat(uintptr_t* out_addr, const char* sym_name) {
         }
     }
     if (!addr) {
-        nupLogf("[compat] LookupNextSymbolForCompat('%s' from %s) -> NOT FOUND\n", sym_name, caller_mod);
+        char caller_s[64];
+        nupFmtAddrMod(caller, caller_s, sizeof(caller_s));
+        nupLogf("[compat] LookupNextSymbolForCompat('%s' from %s @ %s) -> NOT FOUND\n",
+                sym_name, caller_mod, caller_s);
         *out_addr = 0;
         return MAKERESULT(22, 5); // 0xa16
     }
