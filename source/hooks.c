@@ -193,6 +193,8 @@ static u64 g_libnx_heap_used = 0;
 static u64 g_game_heap_base = 0;
 static u64 g_game_heap_size = 0;
 static u64 g_game_heap_cursor = 0;
+static u64 g_compat_heap_reserved = 0;
+static bool g_compat_heap_marked = false;
 static u64 g_vam_flat_used = 0;
 static u32 g_std_alloc_init_logs = 0;
 
@@ -531,6 +533,17 @@ void hooksSetNvHandle(Handle nv_session) {
     g_preopened_nv = nv_session;
 }
 
+void hooksMarkCompatHeapEnd(void) {
+    if (g_compat_heap_marked)
+        return;
+    g_compat_heap_marked = true;
+    g_compat_heap_reserved = g_game_heap_size;
+    if (g_compat_heap_reserved > 0) {
+        nupLogf("[mem] marked compat heap reservation: 0x%llx (excluded from app QueryMemoryInfo)\n",
+                (unsigned long long)g_compat_heap_reserved);
+    }
+}
+
 void hooksInit(NupArchive* nup, FsFileSystem* sd,
                const NupRuntimeCapabilities* caps, Handle hen_sm_proxy) {
     g_nup = nup;
@@ -562,6 +575,8 @@ void hooksInit(NupArchive* nup, FsFileSystem* sd,
     g_game_heap_base = 0;
     g_game_heap_size = 0;
     g_game_heap_cursor = 0;
+    g_compat_heap_reserved = 0;
+    g_compat_heap_marked = false;
     g_vam_flat_used = 0;
     g_std_alloc_init_logs = 0;
     nupSpinInit(&g_handle_lock);
@@ -1924,7 +1939,7 @@ static u32 hook_SetMemoryHeapSize(size_t size) {
     }
 
     u64 aligned_req = (size + 0x1fffffull) & ~0x1fffffull;
-    u64 want_game = g_vam_flat_used + aligned_req;
+    u64 want_game = g_compat_heap_reserved + g_vam_flat_used + aligned_req;
     if (want_game < g_game_heap_size) {
         nupLogf("hook SetMemoryHeapSize(req=0x%zx): keeping larger game=0x%llx\n",
                 size, (unsigned long long)g_game_heap_size);
@@ -1957,10 +1972,22 @@ static u32 hook_SetMemoryHeapSize(size_t size) {
 }
 
 static uintptr_t hook_GetMemoryHeapAddress(void) {
+    if (!g_game_heap_base)
+        return 0;
+    if (g_compat_heap_marked) {
+        return (g_game_heap_size > g_compat_heap_reserved)
+                   ? (uintptr_t)(g_game_heap_base + g_compat_heap_reserved)
+                   : 0;
+    }
     return (uintptr_t)g_game_heap_base;
 }
 
 static size_t hook_GetMemoryHeapSize(void) {
+    if (g_compat_heap_marked) {
+        return (g_game_heap_size > g_compat_heap_reserved)
+                   ? (size_t)(g_game_heap_size - g_compat_heap_reserved)
+                   : 0;
+    }
     return (size_t)g_game_heap_size;
 }
 
@@ -2072,6 +2099,8 @@ static void hook_QueryMemoryInfo(void* out) {
     if (out) {
         u64* q = (u64*)out;
         const u64 orig_avail = q[0];
+        const u64 orig_used = q[1];
+        const u64 real_free = (orig_avail > orig_used) ? (orig_avail - orig_used) : 0;
         if (g_vam_flat_used > 0) {
             // Flat VAM fallback already committed 0x98000000 bytes in StandardAllocator;
             // report avail - used = 0x94000000 (2,368 MiB) so nninitStartup's Allocate(avail - used)
@@ -2079,16 +2108,33 @@ static void hook_QueryMemoryInfo(void* out) {
             q[0] = 0xC0000000ULL;
             q[1] = 0x2C000000ULL;
         } else if (g_caps.target_is_switch1 && q[0] > 0xC0000000ULL) {
-            // Switch 1 ABI expects <= 3 GiB available application RAM; Switch 2 native keeps full RAM.
+            // Switch 1 ABI expects <= 3 GiB available application RAM.
+            // Exclude CompatibilityPack's hidden compat2 heap from totalUsedMemorySize so
+            // (avail - used) cannot underflow when compat2 pre-allocates 3 GiB on Switch 2.
+            if (g_compat_heap_reserved > 0 && q[1] >= g_compat_heap_reserved)
+                q[1] -= g_compat_heap_reserved;
             q[0] = 0xC0000000ULL;
+            // Guarantee reported free (q[0] - q[1]) never underflows and never exceeds
+            // actual remaining physical RAM (leaving 64 MiB headroom for Horizon/NVN/threads).
+            const u64 safe_free = (real_free > 0x4000000ULL)
+                                      ? (real_free - 0x4000000ULL)
+                                      : (real_free / 2ULL);
+            if (q[1] >= q[0] || (q[0] - q[1]) > safe_free)
+                q[1] = (q[0] > safe_free) ? (q[0] - safe_free) : 0;
         }
         // hook_SetMemoryHeapSize calls svcSetHeapSize directly, so sdk's cached heap size
-        // (q[2]) stays 0 unless we synchronize it with our tracked g_game_heap_size.
-        if (g_game_heap_size > 0 && q[2] == 0)
-            q[2] = g_game_heap_size;
-        nupLogf("hook QueryMemoryInfo: avail=0x%llx (raw=0x%llx) used=0x%llx heap=0x%llx\n",
+        // (q[2]) stays 0 unless we synchronize it with the game's own tracked heap size
+        // (excluding compat2's hidden heap).
+        const u64 game_only_heap = (g_game_heap_size > g_compat_heap_reserved)
+                                       ? (g_game_heap_size - g_compat_heap_reserved)
+                                       : 0;
+        if (game_only_heap > 0 && q[2] == 0)
+            q[2] = game_only_heap;
+        nupLogf("hook QueryMemoryInfo: avail=0x%llx (raw=0x%llx) used=0x%llx (raw=0x%llx compat=0x%llx) heap=0x%llx\n",
                 (unsigned long long)q[0], (unsigned long long)orig_avail,
-                (unsigned long long)q[1], (unsigned long long)q[2]);
+                (unsigned long long)q[1], (unsigned long long)orig_used,
+                (unsigned long long)g_compat_heap_reserved,
+                (unsigned long long)q[2]);
     }
 }
 
@@ -2302,6 +2348,7 @@ static void hook_init_sdk_mod(void) {
     // BEFORE nninitInitializeSdkModule invokes compat2's nn::oe::InitializeApplet!
     elfInitSwitch1CompatParams(&g_mods);
     elfRunCompatInitArrays(&g_mods);
+    hooksMarkCompatHeapEnd();
     nupLogf("[6/6] entering nninitInitializeSdkModule @ %p\n", (void*)real_init_sdk_mod);
     if (real_init_sdk_mod) real_init_sdk_mod();
     nupLogf("[6/6] nninitInitializeSdkModule returned\n");
@@ -2311,6 +2358,7 @@ static void hook_init_sdk_mod(void) {
 static void hook_OeInitApplet(void) {
     elfInitSwitch1CompatParams(&g_mods);
     elfRunCompatInitArrays(&g_mods);
+    hooksMarkCompatHeapEnd();
     nupLogf("hook nn::oe::InitializeApplet() @ %p\n", (void*)real_OeInitApplet);
     g_in_oe_init_applet = true;
     if (real_OeInitApplet) real_OeInitApplet();

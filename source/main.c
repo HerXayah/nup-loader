@@ -450,7 +450,7 @@ static void dump_abort_info(const char* tag, const void* info) {
     for (int i = 0; i < 24 && fp; i++) {
         if (!is_readable_addr((u64)(uintptr_t)fp, 16))
             break;
-        u64 lr = fp[1];
+        u64 lr = fp[1] & 0x0000ffffffffffffULL;
         u64* nx = (u64*)(uintptr_t)fp[0];
         char bt_s[64];
         fmt_addr_mod(lr, bt_s, sizeof(bt_s));
@@ -802,7 +802,7 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     snprintf(audit_path, sizeof(audit_path), "/kaihen/audits/%016llx.txt",
              (unsigned long long)entry->title_id);
     nupLogInit(&g_sd, audit_path);
-    nupLogf("=== nup-loader [build=0325-cap1] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
+    nupLogf("=== nup-loader [build=0325-cap2] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
             entry->path, (unsigned long long)entry->title_id,
             entry->is_raw ? "RAW" : "NUP");
 
@@ -883,7 +883,7 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         snprintf(log_path, sizeof(log_path), "/kaihen/nup-loader.log");
     }
     nupLogInit(&g_sd, log_path);
-    nupLogf("=== nup-loader [build=0325-cap1] (%s%s): %s (tid=%016llx) ===\n",
+    nupLogf("=== nup-loader [build=0325-cap2] (%s%s): %s (tid=%016llx) ===\n",
             headless ? "headless" : "ui",
             trace_mode ? "+TRACE" : "",
             entry->path, (unsigned long long)entry->title_id);
@@ -1150,6 +1150,7 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         register_sdk_exception_handler();
         elfInitSwitch1CompatParams(&g_mods);
         elfRunCompatInitArrays(&g_mods);
+        hooksMarkCompatHeapEnd();
         if ((fn = elfFindSymbolSkipCompat1(&g_mods, "__nnDetailInitLibc1")) ||
             (fn = elfFindSymbolSkipCompat1(&g_mods, "_init_libc1"))) {
             nupLogf("[6/6] calling InitLibc1 @ %016llx\n", (unsigned long long)fn);

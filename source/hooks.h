@@ -21,6 +21,7 @@ typedef enum {
 void hooksInit(NupArchive* nup, FsFileSystem* sd,
                const NupRuntimeCapabilities* caps, Handle hen_sm_proxy);
 void hooksSetNvHandle(Handle nv_session);
+void hooksMarkCompatHeapEnd(void);
 
 // Interposition resolver: looks up sym_name in the unified provider registry,
 // binds real_addr into the provider's original-symbol slot when real_addr != 0,
