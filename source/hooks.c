@@ -1897,11 +1897,13 @@ static u32 hook_GetServiceHandle(u32* out_handle, const char* name, size_t name_
         nupLogf("hook GetServiceHandle('%s') -> OK\n", buf);
         return rc;
     }
+    const bool acl_denied = (rc == 0x1015u); // sm::ResultNotAllowed (Module 21, Desc 8)
+    const char* rc_tag = acl_denied ? "ACL_DENIED" : "ERR";
     if (g_hen_sm == INVALID_HANDLE || !buf[0]) {
-        nupLogf("hook GetServiceHandle('%s') -> FAILED real=0x%x\n", buf, rc);
+        nupLogf("hook GetServiceHandle('%s') -> FAILED %s(0x%x) [no HEN proxy]\n", buf, rc_tag, rc);
         return rc;
     }
-    nupLogf("hook GetServiceHandle('%s') real=0x%x -> trying HEN proxy...\n", buf, rc);
+    nupLogf("hook GetServiceHandle('%s') %s(0x%x) -> trying HEN proxy...\n", buf, rc_tag, rc);
     const SmServiceName encoded = smEncodeName(buf);
     Service proxy = {};
     serviceCreate(&proxy, g_hen_sm);
@@ -1911,11 +1913,11 @@ static u32 hook_GetServiceHandle(u32* out_handle, const char* name, size_t name_
         .out_handle_attrs = {SfOutHandleAttr_HipcMove},
         .out_handles = &h);
     if (R_SUCCEEDED(proxy_rc) && h != INVALID_HANDLE) {
-        nupLogf("hook GetServiceHandle('%s') -> HEN proxy OK\n", buf);
+        nupLogf("hook GetServiceHandle('%s') -> HEN proxy OK (bypassed %s)\n", buf, rc_tag);
         if (out_handle) *out_handle = h;
         return 0;
     }
-    nupLogf("hook GetServiceHandle('%s') -> FAILED real=0x%x proxy=0x%x\n", buf, rc, proxy_rc);
+    nupLogf("hook GetServiceHandle('%s') -> FAILED %s(0x%x) proxy=0x%x\n", buf, rc_tag, rc, proxy_rc);
     return rc;
 }
 

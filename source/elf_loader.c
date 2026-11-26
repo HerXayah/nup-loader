@@ -1286,11 +1286,13 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
         }
         if (needs_compat && !has_c1) nupLogBufferedf("  compat1  [COMPAT] discovered=NO\n");
         if (needs_compat && !has_c2) nupLogBufferedf("  compat2  [COMPAT] discovered=NO\n");
-        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | NPDM_SYSRES=%s | TRACE_POOL=%s\n",
-                        compat_state,
-                        (caps && caps->target_npdm_valid)
-                            ? (caps->sysres_sufficient ? "SUFFICIENT" : "INSUFFICIENT")
-                            : "UNKNOWN",
+        const char* stack_state = (!caps) ? "UNKNOWN"
+                                : (caps->platform_stack_match ? "MATCH" : "MISMATCH");
+        const char* vam_state = (!caps) ? "UNKNOWN"
+                              : (caps->target_declares_vam && !caps->vam_capable) ? "BLOCKER"
+                              : (caps->vam_capable ? "PASS" : "OFF");
+        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | STACK=%s | VAM=%s | SYSRES=RUNTIME-BOUNDED | TRACE_POOL=%s\n",
+                        compat_state, stack_state, vam_state,
                         sum.trace_need_tramp <= NUP_TRACE_MAX_SLOTS ? "OK" : "EXCEEDED");
     }
 
