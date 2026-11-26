@@ -697,25 +697,24 @@ static void dump_latest_erpt(Handle hen_sm) {
     serviceClose(&r);
 }
 
-static void log_target_npdm_vs_donor(NupArchive* nup, const NupFileInfo* exefs,
-                                     u32 exefs_count, u64 target_tid) {
-    u64 donor_pid = 0, donor_used = 0, donor_tot = 0, donor_sys_used = 0, donor_sys_tot = 0;
-    svcGetInfo(&donor_pid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&donor_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&donor_tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&donor_sys_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&donor_sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+static void collect_runtime_caps(NupRuntimeCapabilities* caps, NupArchive* nup,
+                                 const NupFileInfo* exefs, u32 exefs_count,
+                                 const ModuleSet* mods, u64 target_tid) {
+    memset(caps, 0, sizeof(*caps));
+    caps->target_tid = target_tid;
+    caps->target_is_switch1 = ((target_tid >> 56) == 0x01);
 
-    nupLogBufferedf("\n--- HOST DONOR ENVIRONMENT (current donor process, not target runtime) ---\n");
-    nupLogBufferedf("  Donor ProgramId:         %016llx (%s)\n",
-                    (unsigned long long)donor_pid,
-                    (donor_pid >> 56) == 0x01 ? "Switch 1 donor" : "Switch 2 donor");
-    nupLogBufferedf("  Donor Memory:            used=0x%llx / total=0x%llx\n",
-                    (unsigned long long)donor_used, (unsigned long long)donor_tot);
-    nupLogBufferedf("  Donor SystemResource:    used=0x%llx / total=0x%llx (expected VAM=%s)\n",
-                    (unsigned long long)donor_sys_used, (unsigned long long)donor_sys_tot,
-                    donor_sys_tot > 0 ? "ENABLED" : "DISABLED");
+    svcGetInfo(&caps->donor_pid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&caps->donor_mem_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&caps->donor_mem_total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&caps->donor_sysres_used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&caps->donor_sysres_total, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
 
+    caps->donor_is_switch1 = ((caps->donor_pid >> 56) == 0x01);
+    caps->vam_capable = (caps->donor_sysres_total > 0);
+    caps->sysres_sufficient = true;
+
+    // Parse target main.npdm (META header)
     const NupFileInfo* npdm_fi = NULL;
     for (u32 i = 0; i < exefs_count; i++) {
         if (strcmp(exefs[i].name, "main.npdm") == 0) {
@@ -723,43 +722,74 @@ static void log_target_npdm_vs_donor(NupArchive* nup, const NupFileInfo* exefs,
             break;
         }
     }
-    if (!npdm_fi) {
-        nupLogBufferedf("  Target main.npdm:        NOT FOUND in ExeFS\n");
-        return;
+    if (npdm_fi) {
+        u8 meta[0x80];
+        memset(meta, 0, sizeof(meta));
+        const size_t rlen = npdm_fi->size < sizeof(meta) ? (size_t)npdm_fi->size : sizeof(meta);
+        if (R_SUCCEEDED(nupReadExefs(nup, npdm_fi, 0, meta, rlen)) &&
+            rlen >= 0x30 && memcmp(meta, "META", 4) == 0) {
+            caps->target_npdm_valid = true;
+            caps->target_npdm_flags = meta[0x0c];
+            caps->target_main_prio = meta[0x0e];
+            caps->target_main_core = meta[0x0f];
+            memcpy(&caps->target_sysres_required, meta + 0x14, 4);
+            memcpy(&caps->target_main_stack_size, meta + 0x1c, 4);
+            memcpy(caps->target_proc_name, meta + 0x20, 16);
+            caps->target_proc_name[16] = '\0';
+            caps->is_64bit = (caps->target_npdm_flags & 1) != 0;
+            caps->sysres_sufficient = (caps->donor_sysres_total >= (u64)caps->target_sysres_required);
+        }
     }
-    u8 meta[0x80];
-    memset(meta, 0, sizeof(meta));
-    const size_t rlen = npdm_fi->size < sizeof(meta) ? (size_t)npdm_fi->size : sizeof(meta);
-    if (R_FAILED(nupReadExefs(nup, npdm_fi, 0, meta, rlen)) || rlen < 0x30 || memcmp(meta, "META", 4) != 0) {
-        nupLogBufferedf("  Target main.npdm:        unreadable or non-META header (size=%llu)\n",
-                        (unsigned long long)npdm_fi->size);
-        return;
-    }
-    const u8 flags = meta[0x0c];
-    const u8 prio = meta[0x0e];
-    const u8 core = meta[0x0f];
-    u32 sysres_req = 0, stack_req = 0;
-    memcpy(&sysres_req, meta + 0x14, 4);
-    memcpy(&stack_req, meta + 0x1c, 4);
-    char proc_name[17];
-    memcpy(proc_name, meta + 0x20, 16);
-    proc_name[16] = '\0';
 
-    nupLogBufferedf("  Target main.npdm:        name='%s' flags=0x%02x (64bit=%d, addrspace=%u) prio=%u core=%u\n",
-                    proc_name, flags, (flags & 1) ? 1 : 0, (flags >> 1) & 7, prio, core);
-    nupLogBufferedf("  Target NPDM SysResource: 0x%x (%u MiB)  MainStack: 0x%x\n",
-                    sysres_req, sysres_req / (1024u * 1024u), stack_req);
-    if (sysres_req > 0 && donor_sys_tot == 0) {
-        nupLogBufferedf("  [!] VAM WARNING: target NPDM requests SystemResourceSize=0x%x, but current donor has 0!\n",
-                        sysres_req);
-    } else if (sysres_req > donor_sys_tot) {
-        nupLogBufferedf("  [!] SYSRES NOTE: target requests 0x%x > donor's 0x%llx\n",
-                        sysres_req, (unsigned long long)donor_sys_tot);
+    if (mods) {
+        for (u32 m = 0; m < mods->count; m++) {
+            const LoadedModule* mod = &mods->mods[m];
+            if (strcmp(mod->name, "compat1") == 0) caps->has_compat1 = true;
+            if (strcmp(mod->name, "compat2") == 0) caps->has_compat2 = true;
+            const u32 fw = mod->nso_base ? *(const u32*)(uintptr_t)mod->nso_base : 0;
+            if (fw == 1 && mod->module_object_off) caps->has_modobj20 = true;
+        }
+        const u64 s5 = elfFindSymbolSkipCompat1(mods, "_ZN2nn4init5StartEmmPFvvES2_S2_");
+        const u64 s4 = elfFindSymbolSkipCompat1(mods, "_ZN2nn4init5StartEmmPFvvES2_");
+        snprintf(caps->entry_kind, sizeof(caps->entry_kind), "%s",
+                 s5 ? "5arg" : (s4 ? "4arg" : "manual"));
     }
-    if ((target_tid >> 56) == 0x01 && (donor_pid >> 56) != 0x01) {
-        nupLogBufferedf("  [!] COMPAT WARNING: Switch 1 target (%016llx) on non-Switch-1 donor (%016llx) lacks CompatibilityPack!\n",
-                        (unsigned long long)target_tid, (unsigned long long)donor_pid);
+}
+
+static void log_runtime_caps(const NupRuntimeCapabilities* c) {
+    nupLogBufferedf("\n--- CAPABILITY & RESOURCE COMPATIBILITY ---\n");
+    nupLogBufferedf("  Donor ProgramId:           %016llx (%s)\n",
+                    (unsigned long long)c->donor_pid,
+                    c->donor_is_switch1 ? "Switch 1 donor" : "Switch 2 donor");
+    nupLogBufferedf("  Donor Memory:              used=0x%llx / total=0x%llx\n",
+                    (unsigned long long)c->donor_mem_used, (unsigned long long)c->donor_mem_total);
+    nupLogBufferedf("  VAM capability:            %s\n", c->vam_capable ? "ENABLED" : "DISABLED");
+    nupLogBufferedf("  System resource capacity:  %llu MiB (0x%llx, used=0x%llx)\n",
+                    (unsigned long long)(c->donor_sysres_total / (1024ULL * 1024ULL)),
+                    (unsigned long long)c->donor_sysres_total,
+                    (unsigned long long)c->donor_sysres_used);
+    if (c->target_npdm_valid) {
+        nupLogBufferedf("  Target main.npdm:          name='%s' flags=0x%02x (64bit=%d, addrspace=%u) prio=%u core=%u stack=0x%x\n",
+                        c->target_proc_name, c->target_npdm_flags, c->is_64bit ? 1 : 0,
+                        (c->target_npdm_flags >> 1) & 7, c->target_main_prio, c->target_main_core,
+                        c->target_main_stack_size);
+        nupLogBufferedf("  Target requirement:        %u MiB (0x%x)\n",
+                        c->target_sysres_required / (1024u * 1024u), c->target_sysres_required);
+        if (c->sysres_sufficient) {
+            nupLogBufferedf("  Resource requirement:      SUFFICIENT\n");
+        } else {
+            const u64 short_bytes = (u64)c->target_sysres_required - c->donor_sysres_total;
+            nupLogBufferedf("  Resource requirement:      INSUFFICIENT (short by %llu MiB / 0x%llx)\n",
+                            (unsigned long long)(short_bytes / (1024ULL * 1024ULL)),
+                            (unsigned long long)short_bytes);
+        }
+    } else {
+        nupLogBufferedf("  Target main.npdm:          NOT FOUND / UNREADABLE\n");
     }
+    const char* cpack = (c->has_compat1 && c->has_compat2) ? "ATTACHED (compat1+compat2)"
+                      : (!c->target_is_switch1 ? "NOT NEEDED (Switch 2 ABI target)"
+                      : "MISSING (Switch 1 ABI target requires Switch 1 donor)");
+    nupLogBufferedf("  CompatibilityPack:         %s\n", cpack);
 }
 
 static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_status_sz) {
@@ -772,7 +802,7 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     snprintf(audit_path, sizeof(audit_path), "/kaihen/audits/%016llx.txt",
              (unsigned long long)entry->title_id);
     nupLogInit(&g_sd, audit_path);
-    nupLogf("=== nup-loader [build=0325-trace4] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
+    nupLogf("=== nup-loader [build=0325-cap1] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
             entry->path, (unsigned long long)entry->title_id,
             entry->is_raw ? "RAW" : "NUP");
 
@@ -804,7 +834,6 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     }
 
     const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
-    log_target_npdm_vs_donor(&g_nup, exefs, exefs_count, sel_tid);
 
     ModuleSet audit_mods = {};
     rc = elfLoadNupModulesForAudit(&audit_mods, &g_nup, exefs, exefs_count);
@@ -817,21 +846,26 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     }
 
     elfAttachSwitch1Compat(&audit_mods, sel_tid);
+    NupRuntimeCapabilities caps = {};
+    collect_runtime_caps(&caps, &g_nup, exefs, exefs_count, &audit_mods, sel_tid);
+    log_runtime_caps(&caps);
+
     printf("  Auditing %u modules...\n", audit_mods.count);
     consoleUpdate(NULL);
 
     ElfAuditSummary sum = {};
-    elfRunStaticAudit(&audit_mods, hooksResolve, &sum);
+    elfRunStaticAudit(&audit_mods, &caps, hooksResolve, &sum);
 
     elfUnloadAuditModules(&audit_mods);
     nupClose(&g_nup);
     nupLogClose();
 
     snprintf(out_status, out_status_sz,
-             "Audit -> %s (m=%u %s unres=%u hook=%u fs=%u tr=%u/%u)",
+             "Audit -> %s (m=%u %s unres=%u hk=%u tr=%u/%u sysres=%s)",
              audit_path, sum.module_count, sum.entry_kind,
-             sum.unresolved_count, sum.hooked_count, sum.unhooked_fs_aoc,
-             sum.trace_need_tramp, NUP_TRACE_MAX_SLOTS);
+             sum.unresolved_count, sum.hooked_count,
+             sum.trace_need_tramp, NUP_TRACE_MAX_SLOTS,
+             caps.sysres_sufficient ? "OK" : "LOW");
     return 0;
 }
 
@@ -849,7 +883,7 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         snprintf(log_path, sizeof(log_path), "/kaihen/nup-loader.log");
     }
     nupLogInit(&g_sd, log_path);
-    nupLogf("=== nup-loader [build=0325-trace4] (%s%s): %s (tid=%016llx) ===\n",
+    nupLogf("=== nup-loader [build=0325-cap1] (%s%s): %s (tid=%016llx) ===\n",
             headless ? "headless" : "ui",
             trace_mode ? "+TRACE" : "",
             entry->path, (unsigned long long)entry->title_id);
@@ -932,13 +966,15 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
 
     const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
     elfAttachSwitch1Compat(&g_mods, sel_tid);
+    NupRuntimeCapabilities caps = {};
+    collect_runtime_caps(&caps, &g_nup, exefs, exefs_count, &g_mods, sel_tid);
     if (trace_mode) {
-        if (!headless) { printf("  [4/6] Running static NPDM + hook/capacity audit...\n"); consoleUpdate(NULL); }
-        log_target_npdm_vs_donor(&g_nup, exefs, exefs_count, sel_tid);
-        elfRunStaticAudit(&g_mods, hooksResolve, NULL);
+        if (!headless) { printf("  [4/6] Running capability + hook/capacity audit...\n"); consoleUpdate(NULL); }
+        log_runtime_caps(&caps);
+        elfRunStaticAudit(&g_mods, &caps, hooksResolve, NULL);
     }
-    if (!headless) { printf("  [4/6] Relocating %u modules & hooking nn::fs / nn::sm...\n", g_mods.count); consoleUpdate(NULL); }
-    hooksInit(&g_nup, &g_sd, sel_tid, hen_sm);
+    if (!headless) { printf("  [4/6] Relocating %u modules & applying compatibility providers...\n", g_mods.count); consoleUpdate(NULL); }
+    hooksInit(&g_nup, &g_sd, &caps, hen_sm);
     u32 unresolved = 0;
     rc = elfRelocateAll(&g_mods, hooksResolve, &unresolved);
     if (R_FAILED(rc)) {
@@ -974,10 +1010,9 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     } else {
         nupLogf("[5/6] headless handoff (console/vi/nv/hid never initialized), closing applet\n");
     }
-    // When CompatibilityPack (compat2) is NOT attached (e.g. testing on a 0400 host),
-    // pre-open GSV nvservices; when compat2 IS attached in a 0100 host, leave GSV
-    // untouched so compat2 initializes appletOE NxCompat2000 -> GSV1 -> 1402 itself!
-    if ((sel_tid >> 56) == 0x01 && !g_mods.has_compat) {
+    // When CompatibilityPack (compat2) is NOT attached (e.g. testing Switch 1 ABI on a Switch 2 donor),
+    // pre-open GSV nvservices; when compat2 IS attached, leave GSV untouched so compat2 initializes it.
+    if (caps.target_is_switch1 && !caps.has_compat2) {
         Result gsv_rc = gsvInitialize();
         Handle nv_h = INVALID_HANDLE;
         Result nv_rc = R_SUCCEEDED(gsv_rc) ? gsvOpenNvServices(&nv_h) : gsv_rc;

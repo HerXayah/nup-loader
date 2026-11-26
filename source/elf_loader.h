@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <switch.h>
 
+#include "compat_caps.h"
 #include "nup.h"
 
 #define MAX_LOADED_MODULES 12
@@ -55,8 +56,9 @@ typedef struct {
     u32 module_count;
     u32 unresolved_count;
     u32 hooked_count;
+    u32 traced_count;
+    u32 native_count;
     u32 unhooked_fs_aoc;
-    u32 unhooked_sys;
     u32 total_jmprel;
     u32 total_glob_dat;
     u32 total_tlsdesc;
@@ -78,8 +80,8 @@ bool elfAttachSwitch1Compat(ModuleSet* set, u64 target_tid);
 void elfInitSwitch1CompatParams(const ModuleSet* set);
 void elfRunCompatInitArrays(ModuleSet* set);
 Result elfRelocateAll(ModuleSet* set, SymbolHookFn hook_fn, u32* out_unresolved);
-void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
-                       ElfAuditSummary* out_summary);
+void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
+                       SymbolHookFn hook_fn, ElfAuditSummary* out_summary);
 u64 elfFindSymbol(const ModuleSet* set, const char* name);
 u64 elfFindSymbolSkipCompat1(const ModuleSet* set, const char* name);
 u64 elfFindSymbolAfterAddr(const ModuleSet* set, u64 caller_addr, const char* name,

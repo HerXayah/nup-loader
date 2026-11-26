@@ -1082,8 +1082,7 @@ static u64 audit_resolve_sym(const ModuleSet* set, const LoadedModule* mod,
 
 static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
                                 const Elf64_Rela* table, u64 bytes,
-                                u8* seen_bits, SymbolHookFn hook_fn,
-                                int pass, ElfAuditSummary* sum) {
+                                u8* seen_bits, int pass, ElfAuditSummary* sum) {
     if (!table || bytes == 0 || !mod->symtab || !mod->strtab)
         return;
     const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
@@ -1107,7 +1106,13 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
             continue;
 
         const u64 resolved = audit_resolve_sym(set, mod, sym, name);
-        const bool is_hooked = hook_fn && (hook_fn(name, 0) != 0);
+        const HookProviderKind prov = hooksQueryProvider(name, NULL);
+        const bool is_hooked = (prov != HOOK_PROV_NONE);
+        const bool is_sdk = (strcmp(mod->name, "sdk") == 0);
+        const bool is_fn = (type == R_AARCH64_JUMP_SLOT) ||
+            (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
+        const bool is_traced = !is_sdk && !is_hooked && resolved && is_fn &&
+                               nupTraceShouldWrap(mod->name, name);
 
         if (pass == 0) {
             if (!resolved && !is_hooked && ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
@@ -1115,26 +1120,34 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
                 nupLogBufferedf("  [UNRESOLVED] %-8s %s\n", mod->name, name);
             }
         } else if (pass == 1) {
-            if (strcmp(mod->name, "sdk") != 0 && !is_hooked && audit_is_fs_aoc(name)) {
+            if (!is_sdk && !is_hooked && audit_is_fs_aoc(name)) {
                 sum->unhooked_fs_aoc++;
-                nupLogBufferedf("  [UNHOOKED-FS] %-8s %s\n", mod->name, name);
+                nupLogBufferedf("  [FS/AOC-NATIVE] %-8s %s%s\n", mod->name, name,
+                                is_traced ? " [TRACED]" : "");
             }
         } else if (pass == 2) {
-            if (strcmp(mod->name, "sdk") != 0 && !is_hooked && !audit_is_fs_aoc(name) && audit_is_sys_api(name)) {
-                sum->unhooked_sys++;
-                nupLogBufferedf("  [UNHOOKED-SYS] %-8s %s\n", mod->name, name);
+            if (!is_sdk && is_hooked) {
+                sum->hooked_count++;
+                nupLogBufferedf("  [HOOKED:%-5s] %-8s %s\n",
+                                hooksProviderName(prov), mod->name, name);
             }
         } else if (pass == 3) {
-            if (strcmp(mod->name, "sdk") != 0 && is_hooked) {
-                sum->hooked_count++;
-                nupLogBufferedf("  [HOOKED] %-8s %s\n", mod->name, name);
+            if (!is_sdk && !is_hooked && resolved) {
+                if (is_traced) {
+                    sum->traced_count++;
+                    if (audit_is_sys_api(name))
+                        nupLogBufferedf("  [TRACED] %-8s %s\n", mod->name, name);
+                } else {
+                    sum->native_count++;
+                }
             }
         }
     }
 }
 
-void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
-                       ElfAuditSummary* out_summary) {
+void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
+                       SymbolHookFn hook_fn, ElfAuditSummary* out_summary) {
+    (void)hook_fn;
     ElfAuditSummary sum;
     memset(&sum, 0, sizeof(sum));
     if (!set)
@@ -1150,7 +1163,6 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
         const bool is_m20 = (first_word == 1 && mod->module_object_off);
         if (is_m20) sum.has_modobj20 = true;
         sum.total_jmprel += (u32)(mod->pltrelsz / sizeof(Elf64_Rela));
-        // Count GLOB_DAT & TLSDESC in RELA
         u32 mod_gdat = 0, mod_tls = 0;
         if (mod->rela && mod->relasz) {
             const Elf64_Rela* r = (const Elf64_Rela*)mod->rela;
@@ -1183,19 +1195,24 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
     const u64 reg_obs = elfFindSymbol(set, "_ZN2nn4diag21RegisterAbortObserverEPNS0_19AbortObserverHolderE");
     const u64 std_alloc2 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocator10InitializeEPvm");
     const u64 std_alloc3 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocator10InitializeEPvmb");
+    const u64 std_ctor2 = elfFindSymbol(set, "_ZN2nn3mem17StandardAllocatorC1EPvm");
     const u64 rtld_auto = elfFindSymbol(set, "_ZN2nn2ro6detail15g_pAutoLoadListE");
     const u64 nvn_boot = elfFindSymbol(set, "nvnBootstrapLoader");
+    const u64 ro_lookup = elfFindSymbol(set, "_ZN2nn2ro12LookupSymbolEPmPKc");
+    const u64 ro_mod_lookup = elfFindSymbol(set, "_ZN2nn2ro18LookupModuleSymbolEPmPKNS0_6ModuleEPKc");
     snprintf(sum.entry_kind, sizeof(sum.entry_kind), "%s",
              start5 ? "5arg" : (start4 ? "4arg" : "manual"));
 
-    nupLogBufferedf("\n--- ENTRY & STARTUP COMPATIBILITY (entry=%s, ModObj20=%d, TLSDESC=%u) ---\n",
+    nupLogBufferedf("\n--- ENTRY, ALLOCATOR & DYNAMIC LOOKUP COVERAGE (entry=%s, ModObj20=%d, TLSDESC=%u) ---\n",
                     sum.entry_kind, sum.has_modobj20 ? 1 : 0, sum.total_tlsdesc);
     nupLogBufferedf("  nn::init::Start(5arg)=%d  (4arg)=%d  nninitStartup=%d  nnMain=%d\n",
                     start5 ? 1 : 0, start4 ? 1 : 0, startup ? 1 : 0, main_sym ? 1 : 0);
     nupLogBufferedf("  nninitInitializeSdkModule=%d  nnosInitialize=%d  SetUserExceptionHandler=%d  AbortObserver=%d\n",
                     init_sdk ? 1 : 0, os_init ? 1 : 0, set_ex ? 1 : 0, reg_obs ? 1 : 0);
-    nupLogBufferedf("  StandardAllocator::Initialize(2arg)=%d  (3arg)=%d  rtld_AutoLoadList=%d  nvnBootstrapLoader=%d\n",
-                    std_alloc2 ? 1 : 0, std_alloc3 ? 1 : 0, rtld_auto ? 1 : 0, nvn_boot ? 1 : 0);
+    nupLogBufferedf("  StandardAllocator: Init(2arg)=%d  Init(3arg)=%d  Ctor(2arg)=%d  rtld_AutoLoadList=%d\n",
+                    std_alloc2 ? 1 : 0, std_alloc3 ? 1 : 0, std_ctor2 ? 1 : 0, rtld_auto ? 1 : 0);
+    nupLogBufferedf("  Dynamic lookup providers: nvnBootstrapLoader=%d(proxy)  ro::LookupSymbol=%d(hooked)  ro::LookupModuleSymbol=%d(hooked)\n",
+                    nvn_boot ? 1 : 0, ro_lookup ? 1 : 0, ro_mod_lookup ? 1 : 0);
 
     // Compute exact PLT/GLOB_DAT trace capacity using the exact shared nupTraceShouldWrap predicate
     {
@@ -1225,7 +1242,7 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
                     const char* name = (sym->st_name < mod->strsz) ? (mod->strtab + sym->st_name) : "";
                     if (!nupTraceShouldWrap(mod->name, name)) continue;
                     sel_total++;
-                    if (hook_fn && hook_fn(name, 0) != 0) sel_hooked++;
+                    if (hooksQueryProvider(name, NULL) != HOOK_PROV_NONE) sel_hooked++;
                     else if (audit_resolve_sym(set, mod, sym, name) != 0) sel_need++;
                 }
             }
@@ -1245,7 +1262,7 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
         else
             nupLogBufferedf("  Capacity:                      EXCEEDED by %u (dedup may reduce)\n",
                             sel_need - NUP_TRACE_MAX_SLOTS);
-        nupLogBufferedf("  Coverage: JUMP_SLOT=Yes | GLOB_DAT(func)=Yes | nvnDeviceGetProcAddress=Proxy | intra-module/SVC=No\n");
+        nupLogBufferedf("  Coverage: JUMP_SLOT=Yes | GLOB_DAT(func)=Yes | nvnDeviceGetProcAddress/ro::Lookup=Proxy | intra-module/SVC=No\n");
     }
 
     {
@@ -1254,6 +1271,10 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
             if (strcmp(set->mods[m].name, "compat1") == 0) has_c1 = true;
             if (strcmp(set->mods[m].name, "compat2") == 0) has_c2 = true;
         }
+        const bool needs_compat = caps ? caps->target_is_switch1 : false;
+        const char* compat_state = (has_c1 && has_c2) ? "COMPLETE"
+                                 : ((has_c1 || has_c2) ? "PARTIAL"
+                                 : (needs_compat ? "MISSING" : "NOT_NEEDED"));
         nupLogBufferedf("\n--- MODULE COVERAGE & AUDIT COMPLETENESS ---\n");
         for (u32 m = 0; m < set->count; m++) {
             const LoadedModule* mod = &set->mods[m];
@@ -1263,18 +1284,21 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
                             (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
                             strcmp(mod->name, "sdk") == 0 ? "NO(callee)" : "YES");
         }
-        if (!has_c1) nupLogBufferedf("  compat1  [COMPAT] discovered=NO\n");
-        if (!has_c2) nupLogBufferedf("  compat2  [COMPAT] discovered=NO\n");
-        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | TRACE_POOL=%s\n",
-                        (has_c1 && has_c2) ? "COMPLETE" : ((has_c1 || has_c2) ? "PARTIAL" : "NONE/N/A"),
+        if (needs_compat && !has_c1) nupLogBufferedf("  compat1  [COMPAT] discovered=NO\n");
+        if (needs_compat && !has_c2) nupLogBufferedf("  compat2  [COMPAT] discovered=NO\n");
+        nupLogBufferedf("  AUDIT COMPLETENESS: TARGET=COMPLETE | COMPAT=%s | SYSRES=%s | TRACE_POOL=%s\n",
+                        compat_state,
+                        (caps && caps->target_npdm_valid)
+                            ? (caps->sysres_sufficient ? "SUFFICIENT" : "INSUFFICIENT")
+                            : "UNKNOWN",
                         sum.trace_need_tramp <= NUP_TRACE_MAX_SLOTS ? "OK" : "EXCEEDED");
     }
 
     static const char* const pass_titles[4] = {
         "UNRESOLVED NON-WEAK SYMBOLS (ALL)",
-        "UNHOOKED nn::fs / nn::aoc IMPORTS (candidates to hook)",
-        "UNHOOKED OS / MEM / OE / AM / VI / NV / SM / ACC / INIT IMPORTS",
-        "MATCHED HOOKED IMPORTS"
+        "NATIVE nn::fs / nn::aoc IMPORTS (unhooked storage/DLC candidates)",
+        "HOOKED IMPORTS (by compatibility provider)",
+        "TRACED IMPORTS (native SDK retained, recorded in Y Trace Launch)"
     };
     for (int pass = 0; pass < 4; pass++) {
         nupLogBufferedf("\n--- %s ---\n", pass_titles[pass]);
@@ -1283,18 +1307,18 @@ void elfRunStaticAudit(const ModuleSet* set, SymbolHookFn hook_fn,
             const size_t bits_sz = ((size_t)mod->sym_count + 7u) / 8u;
             u8* seen = bits_sz ? (u8*)calloc(1, bits_sz) : NULL;
             audit_collect_table(set, mod, (const Elf64_Rela*)mod->jmprel, mod->pltrelsz,
-                                seen, hook_fn, pass, &sum);
+                                seen, pass, &sum);
             audit_collect_table(set, mod, (const Elf64_Rela*)mod->rela, mod->relasz,
-                                seen, hook_fn, pass, &sum);
+                                seen, pass, &sum);
             free(seen);
         }
     }
 
-    nupLogBufferedf("\n--- AUDIT SUMMARY ---\n");
-    nupLogBufferedf("  modules=%u compat=%d entry=%s unresolved=%u hooked=%u unhooked_fs_aoc=%u unhooked_sys=%u\n",
+    nupLogBufferedf("\n--- AUDIT SUMMARY (4-WAY CLASSIFICATION) ---\n");
+    nupLogBufferedf("  modules=%u compat=%d entry=%s | HOOKED=%u TRACED=%u NATIVE=%u UNRESOLVED=%u (fs_aoc_native=%u)\n",
                     sum.module_count, sum.has_compat ? 1 : 0, sum.entry_kind,
-                    sum.unresolved_count, sum.hooked_count,
-                    sum.unhooked_fs_aoc, sum.unhooked_sys);
+                    sum.hooked_count, sum.traced_count, sum.native_count,
+                    sum.unresolved_count, sum.unhooked_fs_aoc);
     nupLogFlush();
 
     if (out_summary)

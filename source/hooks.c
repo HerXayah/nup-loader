@@ -82,6 +82,7 @@ typedef struct {
 static NupArchive* g_nup = NULL;
 static FsFileSystem* g_sd = NULL;
 static u64 g_title_id = 0;
+static NupRuntimeCapabilities g_caps = {};
 static Handle g_hen_sm = INVALID_HANDLE;
 static Handle g_preopened_nv = INVALID_HANDLE;
 
@@ -168,6 +169,7 @@ static void (*real_StdAllocInit2)(void*, void*, size_t) = NULL;
 static void (*real_StdAllocInit3)(void*, void*, size_t, bool) = NULL;
 static void (*real_StdAllocCtor2)(void*, void*, size_t) = NULL;
 static u32 (*real_RoLookupSymbol)(uintptr_t*, const char*) = NULL;
+static u32 (*real_RoLookupModuleSymbol)(uintptr_t*, const void*, const char*) = NULL;
 
 extern ModuleSet g_mods;
 extern void nupOnBeforeInitSdkModule(void);
@@ -529,10 +531,21 @@ void hooksSetNvHandle(Handle nv_session) {
     g_preopened_nv = nv_session;
 }
 
-void hooksInit(NupArchive* nup, FsFileSystem* sd, u64 title_id, Handle hen_sm_proxy) {
+void hooksInit(NupArchive* nup, FsFileSystem* sd,
+               const NupRuntimeCapabilities* caps, Handle hen_sm_proxy) {
     g_nup = nup;
     g_sd = sd;
-    g_title_id = title_id ? title_id : (nup ? nup->title_id : 0);
+    if (caps) {
+        g_caps = *caps;
+        g_title_id = caps->target_tid ? caps->target_tid : (nup ? nup->title_id : 0);
+    } else {
+        memset(&g_caps, 0, sizeof(g_caps));
+        g_title_id = nup ? nup->title_id : 0;
+        g_caps.target_tid = g_title_id;
+        g_caps.target_is_switch1 = ((g_title_id >> 56) == 0x01);
+        svcGetInfo(&g_caps.donor_sysres_total, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+        g_caps.vam_capable = (g_caps.donor_sysres_total > 0);
+    }
     g_hen_sm = hen_sm_proxy;
     g_preopened_nv = INVALID_HANDLE;
     memset(g_mounts, 0, sizeof(g_mounts));
@@ -1999,12 +2012,22 @@ static void* try_alloc_vam_flat_fallback(size_t* io_size) {
     return (void*)block;
 }
 
+static bool needs_vam_flat_fallback(const void* addr, size_t size) {
+    if (addr != NULL || size < 0x40000000ULL)
+        return false;
+    // Capability-driven: only substitute a flat heap arena when the donor lacks
+    // SystemResourceSize (VAM disabled) and runtime SDK confirms VAM is disabled.
+    if (g_caps.vam_capable)
+        return false;
+    return !(real_IsVamEnabled && real_IsVamEnabled());
+}
+
 static void hook_StdAllocInit2(void* self, void* addr, size_t size) {
     log_std_alloc_init_diag("StandardAllocator::Initialize(void*, size_t)", self, addr, size, -1);
-    if (!addr && size >= 0x40000000ULL && !(real_IsVamEnabled && real_IsVamEnabled())) {
+    if (needs_vam_flat_fallback(addr, size)) {
         size_t flat_sz = size;
         void* flat_addr = try_alloc_vam_flat_fallback(&flat_sz);
-        nupLogf("  -> [sysres=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
+        nupLogf("  -> [cap:vam=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
         if (flat_addr) {
             addr = flat_addr;
             size = flat_sz;
@@ -2016,10 +2039,10 @@ static void hook_StdAllocInit2(void* self, void* addr, size_t size) {
 
 static void hook_StdAllocInit3(void* self, void* addr, size_t size, bool is_cache) {
     log_std_alloc_init_diag("StandardAllocator::Initialize(void*, size_t, bool)", self, addr, size, is_cache ? 1 : 0);
-    if (!addr && size >= 0x40000000ULL && !(real_IsVamEnabled && real_IsVamEnabled())) {
+    if (needs_vam_flat_fallback(addr, size)) {
         size_t flat_sz = size;
         void* flat_addr = try_alloc_vam_flat_fallback(&flat_sz);
-        nupLogf("  -> [sysres=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
+        nupLogf("  -> [cap:vam=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
         if (flat_addr) {
             addr = flat_addr;
             size = flat_sz;
@@ -2031,10 +2054,10 @@ static void hook_StdAllocInit3(void* self, void* addr, size_t size, bool is_cach
 
 static void hook_StdAllocCtor2(void* self, void* addr, size_t size) {
     log_std_alloc_init_diag("StandardAllocator::StandardAllocator(void*, size_t)", self, addr, size, -1);
-    if (!addr && size >= 0x40000000ULL && !(real_IsVamEnabled && real_IsVamEnabled())) {
+    if (needs_vam_flat_fallback(addr, size)) {
         size_t flat_sz = size;
         void* flat_addr = try_alloc_vam_flat_fallback(&flat_sz);
-        nupLogf("  -> [sysres=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
+        nupLogf("  -> [cap:vam=0 flat fallback] substituting addr=%p size=0x%zx\n", flat_addr, flat_sz);
         if (flat_addr) {
             addr = flat_addr;
             size = flat_sz;
@@ -2055,12 +2078,12 @@ static void hook_QueryMemoryInfo(void* out) {
             // fits inside the flat StandardAllocator with 64 MiB metadata headroom.
             q[0] = 0xC0000000ULL;
             q[1] = 0x2C000000ULL;
-        } else if ((g_title_id >> 56) == 0x01 && q[0] > 0xC0000000ULL) {
-            // Only clamp Switch 1 titles (01...) to 3 GiB; Switch 2 native titles (04...) need the full ~9 GiB!
+        } else if (g_caps.target_is_switch1 && q[0] > 0xC0000000ULL) {
+            // Switch 1 ABI expects <= 3 GiB available application RAM; Switch 2 native keeps full RAM.
             q[0] = 0xC0000000ULL;
         }
         // hook_SetMemoryHeapSize calls svcSetHeapSize directly, so sdk's cached heap size
-        // (q[2]) stays 0 unless we report our tracked g_game_heap_size!
+        // (q[2]) stays 0 unless we synchronize it with our tracked g_game_heap_size.
         if (g_game_heap_size > 0 && q[2] == 0)
             q[2] = g_game_heap_size;
         nupLogf("hook QueryMemoryInfo: avail=0x%llx (raw=0x%llx) used=0x%llx heap=0x%llx\n",
@@ -2070,28 +2093,30 @@ static void hook_QueryMemoryInfo(void* out) {
 }
 
 static bool hook_GetAocListChangedEvent(void* out_sys_event) {
-    // Initialize as a valid non-signaled local SystemEvent so waiting/destroying it is safe.
+    // Capability-gated local event for SD-virtualized static DLC list:
+    // initialize a real manual-clear local SystemEvent so Wait/Destroy semantics stay valid.
     if (out_sys_event) {
         typedef u32 (*CreateSysEvFn)(void*, int, bool);
         const u64 fn = elfFindSymbol(&g_mods, "_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
         if (fn)
             ((CreateSysEvFn)(uintptr_t)fn)(out_sys_event, 0 /*ManualClear*/, false);
     }
-    nupLogf("hook nn::aoc::GetAddOnContentListChangedEvent(%p) -> OK\n", out_sys_event);
+    nupLogf("hook nn::aoc::GetAddOnContentListChangedEvent(%p) -> OK (dlcs=%d)\n",
+            out_sys_event, g_dlc_count);
     return true;
 }
 
 static u32 hook_RoLookupSymbol(uintptr_t* out_addr, const char* sym_name) {
     if (!out_addr || !sym_name || !sym_name[0])
         return MAKERESULT(22, 5);
-    u64 addr = elfFindSymbol(&g_mods, sym_name);
-    const u64 hooked = hooksResolve(sym_name, addr);
-    if (hooked)
-        addr = hooked;
+    // Two-step resolution: resolve original symbol first, then apply interposition registry.
+    const u64 orig = elfFindSymbol(&g_mods, sym_name);
+    const u64 interposed = hooksResolve(sym_name, orig);
+    const u64 addr = interposed ? interposed : orig;
     if (addr) {
         if (nupTraceIsEnabled()) {
             nupLogBufferedf("[ro_lookup] '%s' -> 0x%llx%s\n", sym_name,
-                            (unsigned long long)addr, hooked ? " [hooked]" : "");
+                            (unsigned long long)addr, interposed ? " [hooked]" : " [native]");
         }
         *out_addr = (uintptr_t)addr;
         return 0;
@@ -2101,6 +2126,25 @@ static u32 hook_RoLookupSymbol(uintptr_t* out_addr, const char* sym_name) {
         nupLogBufferedf("[ro_lookup] '%s' -> real rc=0x%x addr=0x%llx\n",
                         sym_name, rc, (unsigned long long)(*out_addr));
     return rc;
+}
+
+static u32 hook_RoLookupModuleSymbol(uintptr_t* out_addr, const void* mod, const char* sym_name) {
+    if (!out_addr || !sym_name || !sym_name[0])
+        return MAKERESULT(22, 5);
+    u32 rc = real_RoLookupModuleSymbol ? real_RoLookupModuleSymbol(out_addr, mod, sym_name) : MAKERESULT(22, 5);
+    if (R_SUCCEEDED(rc) && *out_addr) {
+        const u64 orig = (u64)(*out_addr);
+        const u64 interposed = hooksResolve(sym_name, orig);
+        if (interposed)
+            *out_addr = (uintptr_t)interposed;
+        if (nupTraceIsEnabled()) {
+            nupLogBufferedf("[ro_mod_lookup] '%s' -> 0x%llx%s\n", sym_name,
+                            (unsigned long long)(*out_addr), interposed ? " [hooked]" : " [native]");
+        }
+        return 0;
+    }
+    // Fallback to global auto-loaded module set if module-local lookup missed
+    return hook_RoLookupSymbol(out_addr, sym_name);
 }
 
 static bool hook_IsVamEnabled(void) {
@@ -2129,10 +2173,10 @@ static u32 hook_AllocAddrRegion(u64* out_addr, size_t size) {
 }
 
 static u32 hook_AllocMemPages(u64 addr, size_t size) {
-    // During nninitStartup, XCX probes RAM in 1 MiB steps until 0x1203 (OutOfResource).
-    // Fail that probe ONCE at 3 GiB (3072 x 1 MiB, matching Switch 1 RAM) so ~9.75 MiB
-    // of the host's 16 MiB SystemResourceSize remains free, then pass all follow-up calls through.
-    if ((g_title_id >> 56) == 0x01 && g_in_nninit_startup && !g_probe_capped && size == 0x100000 && g_alloc_pages_count >= 3072) {
+    // During nninitStartup, Switch 1 titles that probe RAM in 1 MiB steps until 0x1203
+    // can exhaust a 16 MiB SystemResource pool on 6.7 GiB Switch 2 hosts. Cap that probe
+    // ONCE at 3 GiB (3072 x 1 MiB, matching Switch 1 RAM) based on Switch 1 ABI capability.
+    if (g_caps.target_is_switch1 && g_in_nninit_startup && !g_probe_capped && size == 0x100000 && g_alloc_pages_count >= 3072) {
         g_probe_capped = true;
         u64 sys_tot = 0, sys_used = 0;
         svcGetInfo(&sys_tot, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
@@ -2514,195 +2558,227 @@ static void hook_ThrowSystemError(int ev, const char* what) {
     if (real_ThrowSystemError) real_ThrowSystemError(ev, what);
 }
 
-#define HOOK_SYM(sym_str, hook_fn, real_ptr) \
-    if (strcmp(sym_name, sym_str) == 0) { \
-        if (real_addr) *(void**)&(real_ptr) = (void*)(uintptr_t)real_addr; \
-        return (u64)(uintptr_t)(hook_fn); \
+// --- Unified Compatibility Provider Registry ---
+
+typedef struct {
+    const char* sym_name;
+    void* hook_fn;
+    void** real_slot;
+    HookProviderKind provider;
+    bool terminal_for_compat; // Safe to return from LookupNextSymbolForCompat (never recurses into compat)
+} HookProviderEntry;
+
+#define PROV_ONLY(sym, fn, prov, term)   { (sym), (void*)(fn), NULL, (prov), (term) }
+#define PROV_WRAP(sym, fn, real, prov, term) { (sym), (void*)(fn), (void**)&(real), (prov), (term) }
+
+static const HookProviderEntry g_hook_registry[] = {
+    // 1. FS VFS Provider (RomFS, Saves, DeviceSave, Cache, Temp, BCAT, File & Dir I/O -> SD)
+    PROV_ONLY("_ZN2nn2fs22QueryMountRomCacheSizeEPm", hook_QueryMountRomCacheSize1, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs22QueryMountRomCacheSizeEPmNS_13ApplicationIdE", hook_QueryMountRomCacheSizeAppId, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs22QueryMountRomCacheSizeEPmi", hook_QueryMountRomCacheSizeIdx, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs8MountRomEPKc", hook_MountRom1, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs8MountRomEPKcPvm", hook_MountRom3, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs8MountRomEPKcNS_13ApplicationIdEPvm", hook_MountRomAppId, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs8MountRomEPKciPvm", hook_MountRomIdx, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs11CanMountRomENS_13ApplicationIdE", hook_CanMountRom, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs7UnmountEPKc", hook_Unmount, real_Unmount, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs9IsMountedEPKc", hook_IsMounted, real_IsMounted, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs13IsPathMountedEPKc", hook_IsPathMounted, real_IsPathMounted, HOOK_PROV_FS, true),
+
+    PROV_ONLY("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", hook_MountSaveDataUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs13MountSaveDataEPKcNS0_6UserIdE", hook_MountSaveDataUserId, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs13MountSaveDataEPKcNS_13ApplicationIdERKNS_7account3UidE", hook_MountSaveDataAppUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs13MountSaveDataEPKcNS_3ncm13ApplicationIdENS0_6UserIdE", hook_MountSaveDataAppUserId, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", hook_MountSaveDataReadOnlyUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_3ncm13ApplicationIdENS0_6UserIdE", hook_MountSaveDataReadOnlyUserId, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs21MountSaveDataForDebugEPKc", hook_MountSaveDataForDebug, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", hook_EnsureSaveData, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", hook_IsSaveDataExistingUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", hook_IsSaveDataExistingAppUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18IsSaveDataExistingEPbRKNS_7account3UidE", hook_IsSaveDataExistingOutUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18IsSaveDataExistingEPbNS_13ApplicationIdERKNS_7account3UidE", hook_IsSaveDataExistingOutAppUid, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs19MountDeviceSaveDataEPKc", hook_MountDeviceSaveData1, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs19MountDeviceSaveDataEPKcNS_13ApplicationIdE", hook_MountDeviceSaveDataApp, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs19MountDeviceSaveDataEPKcNS_3ncm13ApplicationIdE", hook_MountDeviceSaveDataApp, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs24IsDeviceSaveDataExistingENS_13ApplicationIdE", hook_IsDeviceSaveDataExisting, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs17MountCacheStorageEPKc", hook_MountCacheStorage1, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs17MountCacheStorageEPKci", hook_MountCacheStorageIdx, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs17MountCacheStorageEPKcNS_3ncm13ApplicationIdE", hook_MountCacheStorageApp, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs17MountCacheStorageEPKcNS_3ncm13ApplicationIdEi", hook_MountCacheStorageAppIdx, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18CreateCacheStorageEill", hook_CreateCacheStorageIdx, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18DeleteCacheStorageEi", hook_DeleteCacheStorageIdx, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs21MountTemporaryStorageEPKc", hook_MountTemporaryStorage, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs17MountBcatSaveDataEPKcNS_3ncm13ApplicationIdE", hook_MountBcatSaveData, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs14ExtendSaveDataERKNS_7account3UidEll", hook_ExtendSaveData, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs20ExtendDeviceSaveDataEll", hook_ExtendDeviceSaveData, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs15GetSaveDataSizeEPlS1_RKNS_7account3UidE", hook_GetSaveDataSize, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18GetSaveDataSizeMaxEPlS1_", hook_GetSaveDataSizeMax, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_", hook_GetDeviceSaveDataSize1, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_NS_13ApplicationIdE", hook_GetDeviceSaveDataSizeApp, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs24GetDeviceSaveDataSizeMaxEPlS1_", hook_GetSaveDataSizeMax, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs19GetCacheStorageSizeEPlS1_i", hook_GetCacheStorageSize, HOOK_PROV_FS, true),
+    PROV_ONLY("_ZN2nn2fs18GetCacheStorageMaxEPiPl", hook_GetCacheStorageMax, HOOK_PROV_FS, true),
+
+    PROV_WRAP("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", hook_GetEntryType, real_GetEntryType, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", hook_OpenFile, real_OpenFile, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", hook_ReadFile4, real_ReadFile4, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvmRKNS0_10ReadOptionE", hook_ReadFile5Opt, real_ReadFile5Opt, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", hook_ReadFile5Out, real_ReadFile5Out, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", hook_ReadFile6, real_ReadFile6, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs14ReadFileAtOnceEPKcPvm", hook_ReadFileAtOnce, real_ReadFileAtOnce, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", hook_WriteFile, real_WriteFile, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs9FlushFileENS0_10FileHandleE", hook_FlushFile, real_FlushFile, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", hook_SetFileSize, real_SetFileSize, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", hook_GetFileSize, real_GetFileSize, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", hook_GetFileOpenMode, real_GetFileOpenMode, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs9CloseFileENS0_10FileHandleE", hook_CloseFile, real_CloseFile, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs10CreateFileEPKcl", hook_CreateFile2, real_CreateFile2, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs10CreateFileEPKcli", hook_CreateFile3, real_CreateFile3, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs24CreateAndWriteFileAtOnceEPKcPKvm", hook_CreateAndWriteFileAtOnce, real_CreateAndWriteFileAtOnce, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs10DeleteFileEPKc", hook_DeleteFile, real_DeleteFile, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs10RenameFileEPKcS2_", hook_RenameFile, real_RenameFile, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs15CreateDirectoryEPKc", hook_CreateDirectory, real_CreateDirectory, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs15DeleteDirectoryEPKc", hook_DeleteDirectory, real_DeleteDirectory, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", hook_DeleteDirectoryRec, real_DeleteDirectoryRec, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs25CleanDirectoryRecursivelyEPKc", hook_CleanDirectoryRec, real_CleanDirectoryRec, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs15RenameDirectoryEPKcS2_", hook_RenameDirectory, real_RenameDirectory, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs16GetFreeSpaceSizeEPlPKc", hook_GetFreeSpaceSize, real_GetFreeSpaceSize, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs17GetTotalSpaceSizeEPlPKc", hook_GetTotalSpaceSize, real_GetTotalSpaceSize, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs6CommitEPKc", hook_Commit1, real_Commit1, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE", hook_Commit2, real_Commit2, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs6CommitEPKPKci", hook_CommitMulti, real_CommitMulti, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs14CommitSaveDataEPKc", hook_CommitSaveData, real_CommitSaveData, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", hook_OpenDirectory, real_OpenDirectory, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", hook_ReadDirectory, real_ReadDirectory, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", hook_GetDirEntryCount, real_GetDirEntryCount, HOOK_PROV_FS, true),
+    PROV_WRAP("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", hook_CloseDirectory, real_CloseDirectory, HOOK_PROV_FS, true),
+
+    // 2. AOC / DLC Provider -> SD card
+    PROV_ONLY("_ZN2nn3aoc17CountAddOnContentEv", hook_CountAddOnContent, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc16ListAddOnContentEPiii", hook_ListAddOnContent, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc21GetAddOnContentBaseIdEv", hook_GetAddOnContentBaseId, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc19PrepareAddOnContentEi", hook_PrepareAddOnContent, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc16UpdateCachedListEv", hook_AocNoopVoid, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc28CheckAddOnContentMountStatusEv", hook_AocOkU32, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc23NotifyMountAddOnContentENS_3ncm6DataIdE", hook_NotifyAocDataId, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc25NotifyUnmountAddOnContentENS_3ncm6DataIdE", hook_NotifyAocDataId, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn3aoc31GetAddOnContentListChangedEventEPNS_2os11SystemEventE", hook_GetAocListChangedEvent, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", hook_QueryMountAddOnContentCacheSize, HOOK_PROV_AOC, true),
+    PROV_ONLY("_ZN2nn2fs17MountAddOnContentEPKciPvm", hook_MountAddOnContent, HOOK_PROV_AOC, true),
+
+    // 3. Memory Provider (synchronized heap size/address, QueryMemoryInfo, VAM)
+    PROV_WRAP("_ZN2nn2os17SetMemoryHeapSizeEm", hook_SetMemoryHeapSize, real_SetMemoryHeapSize, HOOK_PROV_MEM, true),
+    PROV_ONLY("_ZN2nn2os20GetMemoryHeapAddressEv", hook_GetMemoryHeapAddress, HOOK_PROV_MEM, true),
+    PROV_ONLY("_ZN2nn2os17GetMemoryHeapSizeEv", hook_GetMemoryHeapSize, HOOK_PROV_MEM, true),
+    PROV_ONLY("_ZN2nn2os19AllocateMemoryBlockEPmm", hook_AllocateMemoryBlock, HOOK_PROV_MEM, true),
+    PROV_ONLY("_ZN2nn2os15FreeMemoryBlockEmm", hook_FreeMemoryBlock, HOOK_PROV_MEM, true),
+    PROV_WRAP("_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE", hook_QueryMemoryInfo, real_QueryMemoryInfo, HOOK_PROV_MEM, true),
+    PROV_WRAP("_ZN2nn2os29IsVirtualAddressMemoryEnabledEv", hook_IsVamEnabled, real_IsVamEnabled, HOOK_PROV_MEM, false),
+    PROV_WRAP("_ZN2nn2os21AllocateAddressRegionEPmm", hook_AllocAddrRegion, real_AllocAddrRegion, HOOK_PROV_MEM, false),
+    PROV_WRAP("_ZN2nn2os19AllocateMemoryPagesEmm", hook_AllocMemPages, real_AllocMemPages, HOOK_PROV_MEM, false),
+    PROV_WRAP("_ZN2nn2os15FreeMemoryPagesEmm", hook_FreeMemPages, real_FreeMemPages, HOOK_PROV_MEM, false),
+
+    // 4. Allocator Provider (StandardAllocator Initialize overloads + 2-arg ctor)
+    PROV_WRAP("_ZN2nn3mem17StandardAllocator10InitializeEPvm", hook_StdAllocInit2, real_StdAllocInit2, HOOK_PROV_ALLOC, false),
+    PROV_WRAP("_ZN2nn3mem17StandardAllocator10InitializeEPvmb", hook_StdAllocInit3, real_StdAllocInit3, HOOK_PROV_ALLOC, false),
+    PROV_WRAP("_ZN2nn3mem17StandardAllocatorC1EPvm", hook_StdAllocCtor2, real_StdAllocCtor2, HOOK_PROV_ALLOC, false),
+
+    // 5. RTLD / Dynamic Symbol Resolution Provider
+    PROV_WRAP("_ZN2nn2ro12LookupSymbolEPmPKc", hook_RoLookupSymbol, real_RoLookupSymbol, HOOK_PROV_RTLD, false),
+    PROV_WRAP("_ZN2nn2ro18LookupModuleSymbolEPmPKNS0_6ModuleEPKc", hook_RoLookupModuleSymbol, real_RoLookupModuleSymbol, HOOK_PROV_RTLD, false),
+
+    // 6. Service Proxy, Graphics, Threading & Boot/Abort Diagnostics Provider
+    PROV_WRAP("_ZN2nn2sm16GetServiceHandleEPNS_3svc6HandleEPKcm", hook_GetServiceHandle, real_GetServiceHandle, HOOK_PROV_SVC, true),
+    PROV_WRAP("_ZN2nn2vi10InitializeEv", hook_ViInitialize, real_ViInitialize, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", hook_ViOpenDefaultDisplay, real_ViOpenDefaultDisplay, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", hook_ViCreateLayer, real_ViCreateLayer, HOOK_PROV_SVC, false),
+    PROV_WRAP("nvnBootstrapLoader", hook_NvnBootstrapLoader, real_NvnBootstrapLoader, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi", hook_CreateThread6, real_CreateThread6, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii", hook_CreateThread7, real_CreateThread7, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZNK2nn2os6detail26ThreadManagerImplByHorizon13MapAliasStackEPPvPKvm", hook_MapAliasStack, real_MapAliasStack, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os13SetThreadNameEPNS0_10ThreadTypeEPKc", hook_SetThreadName, real_SetThreadName, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc", hook_SetThreadNamePtr, real_SetThreadNamePtr, HOOK_PROV_SVC, false),
+
+    PROV_WRAP("_init_libc1", hook_init_libc1, real_init_libc1, HOOK_PROV_SVC, false),
+    PROV_WRAP("nninitInitializeSdkModule", hook_init_sdk_mod, real_init_sdk_mod, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2oe16InitializeAppletEv", hook_OeInitApplet, real_OeInitApplet, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2am31InitializeApplicationInterfacesEv", hook_AmInitAppInterfaces, real_AmInitAppInterfaces, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2sm8FinalizeEv", hook_SmFinalize, real_SmFinalize, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE", hook_AttachSysEvent, real_AttachSysEvent, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2oe20SetupGpuErrorHandlerEv", hook_SetupGpuErrorHandler, real_SetupGpuErrorHandler, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE", hook_WaitSystemEvent, real_WaitSystemEvent, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2oe20GetCurrentFocusStateEv", hook_GetCurrentFocusState, real_GetCurrentFocusState, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", hook_SetFocusHandlingMode, real_SetFocusHandlingMode, HOOK_PROV_SVC, false),
+    PROV_WRAP("nninitStartup", hook_nninitStartup, real_nninitStartup, HOOK_PROV_SVC, false),
+    PROV_WRAP("nnMain", hook_nnMain, real_nnMain, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn4diag6detail9AbortImplEv", hook_AbortImpl0, real_AbortImpl0, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", hook_AbortImplRes, real_AbortImplRes, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZSt9terminatev", hook_StdTerminate, real_StdTerminate, HOOK_PROV_SVC, false),
+    PROV_WRAP("__assert_fail", hook_AssertFail, real_AssertFail, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZNSt3__122__libcpp_verbose_abortEPKcz", hook_LibcppVerboseAbort, real_LibcppVerboseAbort, HOOK_PROV_SVC, false),
+    PROV_WRAP("_ZNSt3__120__throw_system_errorEiPKc", hook_ThrowSystemError, real_ThrowSystemError, HOOK_PROV_SVC, false),
+};
+
+static const HookProviderEntry* find_registry_entry(const char* sym_name) {
+    if (!sym_name || !sym_name[0])
+        return NULL;
+    const size_t n = sizeof(g_hook_registry) / sizeof(g_hook_registry[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(sym_name, g_hook_registry[i].sym_name) == 0)
+            return &g_hook_registry[i];
     }
-
-#define HOOK_ONLY(sym_str, hook_fn) \
-    if (strcmp(sym_name, sym_str) == 0) { \
-        return (u64)(uintptr_t)(hook_fn); \
-    }
-
-u64 hooksResolve(const char* sym_name, u64 real_addr) {
-    // RomFS mount / query
-    HOOK_ONLY("_ZN2nn2fs22QueryMountRomCacheSizeEPm", hook_QueryMountRomCacheSize1);
-    HOOK_ONLY("_ZN2nn2fs22QueryMountRomCacheSizeEPmNS_13ApplicationIdE", hook_QueryMountRomCacheSizeAppId);
-    HOOK_ONLY("_ZN2nn2fs22QueryMountRomCacheSizeEPmi", hook_QueryMountRomCacheSizeIdx);
-    HOOK_ONLY("_ZN2nn2fs8MountRomEPKc", hook_MountRom1);
-    HOOK_ONLY("_ZN2nn2fs8MountRomEPKcPvm", hook_MountRom3);
-    HOOK_ONLY("_ZN2nn2fs8MountRomEPKcNS_13ApplicationIdEPvm", hook_MountRomAppId);
-    HOOK_ONLY("_ZN2nn2fs8MountRomEPKciPvm", hook_MountRomIdx);
-    HOOK_ONLY("_ZN2nn2fs11CanMountRomENS_13ApplicationIdE", hook_CanMountRom);
-    HOOK_SYM("_ZN2nn2fs7UnmountEPKc", hook_Unmount, real_Unmount);
-    HOOK_SYM("_ZN2nn2fs9IsMountedEPKc", hook_IsMounted, real_IsMounted);
-    HOOK_SYM("_ZN2nn2fs13IsPathMountedEPKc", hook_IsPathMounted, real_IsPathMounted);
-
-    // Save / DeviceSave / Cache / Temp / BCAT -> SD card
-    HOOK_ONLY("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", hook_MountSaveDataUid);
-    HOOK_ONLY("_ZN2nn2fs13MountSaveDataEPKcNS0_6UserIdE", hook_MountSaveDataUserId);
-    HOOK_ONLY("_ZN2nn2fs13MountSaveDataEPKcNS_13ApplicationIdERKNS_7account3UidE", hook_MountSaveDataAppUid);
-    HOOK_ONLY("_ZN2nn2fs13MountSaveDataEPKcNS_3ncm13ApplicationIdENS0_6UserIdE", hook_MountSaveDataAppUserId);
-    HOOK_ONLY("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", hook_MountSaveDataReadOnlyUid);
-    HOOK_ONLY("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_3ncm13ApplicationIdENS0_6UserIdE", hook_MountSaveDataReadOnlyUserId);
-    HOOK_ONLY("_ZN2nn2fs21MountSaveDataForDebugEPKc", hook_MountSaveDataForDebug);
-    HOOK_ONLY("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", hook_EnsureSaveData);
-    HOOK_ONLY("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", hook_IsSaveDataExistingUid);
-    HOOK_ONLY("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", hook_IsSaveDataExistingAppUid);
-    HOOK_ONLY("_ZN2nn2fs18IsSaveDataExistingEPbRKNS_7account3UidE", hook_IsSaveDataExistingOutUid);
-    HOOK_ONLY("_ZN2nn2fs18IsSaveDataExistingEPbNS_13ApplicationIdERKNS_7account3UidE", hook_IsSaveDataExistingOutAppUid);
-    HOOK_ONLY("_ZN2nn2fs19MountDeviceSaveDataEPKc", hook_MountDeviceSaveData1);
-    HOOK_ONLY("_ZN2nn2fs19MountDeviceSaveDataEPKcNS_13ApplicationIdE", hook_MountDeviceSaveDataApp);
-    HOOK_ONLY("_ZN2nn2fs19MountDeviceSaveDataEPKcNS_3ncm13ApplicationIdE", hook_MountDeviceSaveDataApp);
-    HOOK_ONLY("_ZN2nn2fs24IsDeviceSaveDataExistingENS_13ApplicationIdE", hook_IsDeviceSaveDataExisting);
-    HOOK_ONLY("_ZN2nn2fs17MountCacheStorageEPKc", hook_MountCacheStorage1);
-    HOOK_ONLY("_ZN2nn2fs17MountCacheStorageEPKci", hook_MountCacheStorageIdx);
-    HOOK_ONLY("_ZN2nn2fs17MountCacheStorageEPKcNS_3ncm13ApplicationIdE", hook_MountCacheStorageApp);
-    HOOK_ONLY("_ZN2nn2fs17MountCacheStorageEPKcNS_3ncm13ApplicationIdEi", hook_MountCacheStorageAppIdx);
-    HOOK_ONLY("_ZN2nn2fs18CreateCacheStorageEill", hook_CreateCacheStorageIdx);
-    HOOK_ONLY("_ZN2nn2fs18DeleteCacheStorageEi", hook_DeleteCacheStorageIdx);
-    HOOK_ONLY("_ZN2nn2fs21MountTemporaryStorageEPKc", hook_MountTemporaryStorage);
-    HOOK_ONLY("_ZN2nn2fs17MountBcatSaveDataEPKcNS_3ncm13ApplicationIdE", hook_MountBcatSaveData);
-    HOOK_ONLY("_ZN2nn2fs14ExtendSaveDataERKNS_7account3UidEll", hook_ExtendSaveData);
-    HOOK_ONLY("_ZN2nn2fs20ExtendDeviceSaveDataEll", hook_ExtendDeviceSaveData);
-    HOOK_ONLY("_ZN2nn2fs15GetSaveDataSizeEPlS1_RKNS_7account3UidE", hook_GetSaveDataSize);
-    HOOK_ONLY("_ZN2nn2fs18GetSaveDataSizeMaxEPlS1_", hook_GetSaveDataSizeMax);
-    HOOK_ONLY("_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_", hook_GetDeviceSaveDataSize1);
-    HOOK_ONLY("_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_NS_13ApplicationIdE", hook_GetDeviceSaveDataSizeApp);
-    HOOK_ONLY("_ZN2nn2fs24GetDeviceSaveDataSizeMaxEPlS1_", hook_GetSaveDataSizeMax);
-    HOOK_ONLY("_ZN2nn2fs19GetCacheStorageSizeEPlS1_i", hook_GetCacheStorageSize);
-    HOOK_ONLY("_ZN2nn2fs18GetCacheStorageMaxEPiPl", hook_GetCacheStorageMax);
-
-    // DLC (nn::aoc + MountAddOnContent) -> SD card
-    HOOK_ONLY("_ZN2nn3aoc17CountAddOnContentEv", hook_CountAddOnContent);
-    HOOK_ONLY("_ZN2nn3aoc16ListAddOnContentEPiii", hook_ListAddOnContent);
-    HOOK_ONLY("_ZN2nn3aoc21GetAddOnContentBaseIdEv", hook_GetAddOnContentBaseId);
-    HOOK_ONLY("_ZN2nn3aoc19PrepareAddOnContentEi", hook_PrepareAddOnContent);
-    HOOK_ONLY("_ZN2nn3aoc16UpdateCachedListEv", hook_AocNoopVoid);
-    HOOK_ONLY("_ZN2nn3aoc28CheckAddOnContentMountStatusEv", hook_AocOkU32);
-    HOOK_ONLY("_ZN2nn3aoc23NotifyMountAddOnContentENS_3ncm6DataIdE", hook_NotifyAocDataId);
-    HOOK_ONLY("_ZN2nn3aoc25NotifyUnmountAddOnContentENS_3ncm6DataIdE", hook_NotifyAocDataId);
-    HOOK_ONLY("_ZN2nn3aoc31GetAddOnContentListChangedEventEPNS_2os11SystemEventE", hook_GetAocListChangedEvent);
-    HOOK_ONLY("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", hook_QueryMountAddOnContentCacheSize);
-    HOOK_ONLY("_ZN2nn2fs17MountAddOnContentEPKciPvm", hook_MountAddOnContent);
-
-    // File & Directory I/O (Read + Write)
-    HOOK_SYM("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", hook_GetEntryType, real_GetEntryType);
-    HOOK_SYM("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", hook_OpenFile, real_OpenFile);
-    HOOK_SYM("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", hook_ReadFile4, real_ReadFile4);
-    HOOK_SYM("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvmRKNS0_10ReadOptionE", hook_ReadFile5Opt, real_ReadFile5Opt);
-    HOOK_SYM("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", hook_ReadFile5Out, real_ReadFile5Out);
-    HOOK_SYM("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", hook_ReadFile6, real_ReadFile6);
-    HOOK_SYM("_ZN2nn2fs14ReadFileAtOnceEPKcPvm", hook_ReadFileAtOnce, real_ReadFileAtOnce);
-    HOOK_SYM("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", hook_WriteFile, real_WriteFile);
-    HOOK_SYM("_ZN2nn2fs9FlushFileENS0_10FileHandleE", hook_FlushFile, real_FlushFile);
-    HOOK_SYM("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", hook_SetFileSize, real_SetFileSize);
-    HOOK_SYM("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", hook_GetFileSize, real_GetFileSize);
-    HOOK_SYM("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", hook_GetFileOpenMode, real_GetFileOpenMode);
-    HOOK_SYM("_ZN2nn2fs9CloseFileENS0_10FileHandleE", hook_CloseFile, real_CloseFile);
-    HOOK_SYM("_ZN2nn2fs10CreateFileEPKcl", hook_CreateFile2, real_CreateFile2);
-    HOOK_SYM("_ZN2nn2fs10CreateFileEPKcli", hook_CreateFile3, real_CreateFile3);
-    HOOK_SYM("_ZN2nn2fs24CreateAndWriteFileAtOnceEPKcPKvm", hook_CreateAndWriteFileAtOnce, real_CreateAndWriteFileAtOnce);
-    HOOK_SYM("_ZN2nn2fs10DeleteFileEPKc", hook_DeleteFile, real_DeleteFile);
-    HOOK_SYM("_ZN2nn2fs10RenameFileEPKcS2_", hook_RenameFile, real_RenameFile);
-    HOOK_SYM("_ZN2nn2fs15CreateDirectoryEPKc", hook_CreateDirectory, real_CreateDirectory);
-    HOOK_SYM("_ZN2nn2fs15DeleteDirectoryEPKc", hook_DeleteDirectory, real_DeleteDirectory);
-    HOOK_SYM("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", hook_DeleteDirectoryRec, real_DeleteDirectoryRec);
-    HOOK_SYM("_ZN2nn2fs25CleanDirectoryRecursivelyEPKc", hook_CleanDirectoryRec, real_CleanDirectoryRec);
-    HOOK_SYM("_ZN2nn2fs15RenameDirectoryEPKcS2_", hook_RenameDirectory, real_RenameDirectory);
-    HOOK_SYM("_ZN2nn2fs16GetFreeSpaceSizeEPlPKc", hook_GetFreeSpaceSize, real_GetFreeSpaceSize);
-    HOOK_SYM("_ZN2nn2fs17GetTotalSpaceSizeEPlPKc", hook_GetTotalSpaceSize, real_GetTotalSpaceSize);
-    HOOK_SYM("_ZN2nn2fs6CommitEPKc", hook_Commit1, real_Commit1);
-    HOOK_SYM("_ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE", hook_Commit2, real_Commit2);
-    HOOK_SYM("_ZN2nn2fs6CommitEPKPKci", hook_CommitMulti, real_CommitMulti);
-    HOOK_SYM("_ZN2nn2fs14CommitSaveDataEPKc", hook_CommitSaveData, real_CommitSaveData);
-    HOOK_SYM("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", hook_OpenDirectory, real_OpenDirectory);
-    HOOK_SYM("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", hook_ReadDirectory, real_ReadDirectory);
-    HOOK_SYM("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", hook_GetDirEntryCount, real_GetDirEntryCount);
-    HOOK_SYM("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", hook_CloseDirectory, real_CloseDirectory);
-
-    // Service manager, VI, NVN & memory
-    HOOK_SYM("_ZN2nn2sm16GetServiceHandleEPNS_3svc6HandleEPKcm", hook_GetServiceHandle, real_GetServiceHandle);
-    HOOK_SYM("_ZN2nn2vi10InitializeEv", hook_ViInitialize, real_ViInitialize);
-    HOOK_SYM("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", hook_ViOpenDefaultDisplay, real_ViOpenDefaultDisplay);
-    HOOK_SYM("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", hook_ViCreateLayer, real_ViCreateLayer);
-    HOOK_SYM("nvnBootstrapLoader", hook_NvnBootstrapLoader, real_NvnBootstrapLoader);
-    HOOK_SYM("_ZN2nn2os17SetMemoryHeapSizeEm", hook_SetMemoryHeapSize, real_SetMemoryHeapSize);
-    HOOK_ONLY("_ZN2nn2os20GetMemoryHeapAddressEv", hook_GetMemoryHeapAddress);
-    HOOK_ONLY("_ZN2nn2os17GetMemoryHeapSizeEv", hook_GetMemoryHeapSize);
-    HOOK_SYM("_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE", hook_QueryMemoryInfo, real_QueryMemoryInfo);
-    HOOK_SYM("_ZN2nn2os29IsVirtualAddressMemoryEnabledEv", hook_IsVamEnabled, real_IsVamEnabled);
-    HOOK_SYM("_ZN2nn2os21AllocateAddressRegionEPmm", hook_AllocAddrRegion, real_AllocAddrRegion);
-    HOOK_SYM("_ZN2nn2os19AllocateMemoryPagesEmm", hook_AllocMemPages, real_AllocMemPages);
-    HOOK_SYM("_ZN2nn2os15FreeMemoryPagesEmm", hook_FreeMemPages, real_FreeMemPages);
-    HOOK_SYM("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi", hook_CreateThread6, real_CreateThread6);
-    HOOK_SYM("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii", hook_CreateThread7, real_CreateThread7);
-    HOOK_SYM("_ZNK2nn2os6detail26ThreadManagerImplByHorizon13MapAliasStackEPPvPKvm", hook_MapAliasStack, real_MapAliasStack);
-    HOOK_SYM("_ZN2nn2os13SetThreadNameEPNS0_10ThreadTypeEPKc", hook_SetThreadName, real_SetThreadName);
-    HOOK_SYM("_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc", hook_SetThreadNamePtr, real_SetThreadNamePtr);
-    HOOK_ONLY("_ZN2nn2os19AllocateMemoryBlockEPmm", hook_AllocateMemoryBlock);
-    HOOK_ONLY("_ZN2nn2os15FreeMemoryBlockEmm", hook_FreeMemoryBlock);
-    HOOK_SYM("_ZN2nn3mem17StandardAllocator10InitializeEPvm", hook_StdAllocInit2, real_StdAllocInit2);
-    HOOK_SYM("_ZN2nn3mem17StandardAllocator10InitializeEPvmb", hook_StdAllocInit3, real_StdAllocInit3);
-    HOOK_SYM("_ZN2nn3mem17StandardAllocatorC1EPvm", hook_StdAllocCtor2, real_StdAllocCtor2);
-    HOOK_SYM("_ZN2nn2ro12LookupSymbolEPmPKc", hook_RoLookupSymbol, real_RoLookupSymbol);
-
-    // Boot & abort trace
-    HOOK_SYM("_init_libc1", hook_init_libc1, real_init_libc1);
-    HOOK_SYM("nninitInitializeSdkModule", hook_init_sdk_mod, real_init_sdk_mod);
-    HOOK_SYM("_ZN2nn2oe16InitializeAppletEv", hook_OeInitApplet, real_OeInitApplet);
-    HOOK_SYM("_ZN2nn2am31InitializeApplicationInterfacesEv", hook_AmInitAppInterfaces, real_AmInitAppInterfaces);
-    HOOK_SYM("_ZN2nn2sm8FinalizeEv", hook_SmFinalize, real_SmFinalize);
-    HOOK_SYM("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE", hook_AttachSysEvent, real_AttachSysEvent);
-    HOOK_SYM("_ZN2nn2oe20SetupGpuErrorHandlerEv", hook_SetupGpuErrorHandler, real_SetupGpuErrorHandler);
-    HOOK_SYM("_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE", hook_WaitSystemEvent, real_WaitSystemEvent);
-    HOOK_SYM("_ZN2nn2oe20GetCurrentFocusStateEv", hook_GetCurrentFocusState, real_GetCurrentFocusState);
-    HOOK_SYM("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", hook_SetFocusHandlingMode, real_SetFocusHandlingMode);
-    HOOK_SYM("nninitStartup", hook_nninitStartup, real_nninitStartup);
-    HOOK_SYM("nnMain", hook_nnMain, real_nnMain);
-    HOOK_SYM("_ZN2nn4diag6detail9AbortImplEv", hook_AbortImpl0, real_AbortImpl0);
-    HOOK_SYM("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", hook_AbortImplRes, real_AbortImplRes);
-    HOOK_SYM("_ZSt9terminatev", hook_StdTerminate, real_StdTerminate);
-    HOOK_SYM("__assert_fail", hook_AssertFail, real_AssertFail);
-    HOOK_SYM("_ZNSt3__122__libcpp_verbose_abortEPKcz", hook_LibcppVerboseAbort, real_LibcppVerboseAbort);
-    HOOK_SYM("_ZNSt3__120__throw_system_errorEiPKc", hook_ThrowSystemError, real_ThrowSystemError);
-    return 0;
+    return NULL;
 }
 
-static bool is_terminal_compat_hook(const char* sym_name) {
-    // Only return our hook from LookupNextSymbolForCompat for virtualized terminal
-    // subsystems (heap, SM proxy, FS/AOC VFS) that NEVER recurse back into compat1/compat2.
-    return (strcmp(sym_name, "_ZN2nn2os17SetMemoryHeapSizeEm") == 0 ||
-            strcmp(sym_name, "_ZN2nn2os19AllocateMemoryBlockEPmm") == 0 ||
-            strcmp(sym_name, "_ZN2nn2os15FreeMemoryBlockEmm") == 0 ||
-            strcmp(sym_name, "_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE") == 0 ||
-            strcmp(sym_name, "_ZN2nn2sm16GetServiceHandleEPNS_3svc6HandleEPKcm") == 0 ||
-            strncmp(sym_name, "_ZN2nn2fs", 9) == 0 ||
-            strncmp(sym_name, "_ZN2nn3aoc", 10) == 0);
+const char* hooksProviderName(HookProviderKind kind) {
+    switch (kind) {
+    case HOOK_PROV_FS:    return "FS";
+    case HOOK_PROV_AOC:   return "AOC";
+    case HOOK_PROV_MEM:   return "MEM";
+    case HOOK_PROV_ALLOC: return "ALLOC";
+    case HOOK_PROV_RTLD:  return "RTLD";
+    case HOOK_PROV_SVC:   return "SVC";
+    default:              return "NONE";
+    }
+}
+
+HookProviderKind hooksQueryProvider(const char* sym_name, bool* out_terminal_for_compat) {
+    const HookProviderEntry* e = find_registry_entry(sym_name);
+    if (!e) {
+        if (out_terminal_for_compat) *out_terminal_for_compat = false;
+        return HOOK_PROV_NONE;
+    }
+    if (out_terminal_for_compat) *out_terminal_for_compat = e->terminal_for_compat;
+    return e->provider;
+}
+
+u64 hooksResolve(const char* sym_name, u64 real_addr) {
+    const HookProviderEntry* e = find_registry_entry(sym_name);
+    if (!e)
+        return 0;
+    if (real_addr && e->real_slot)
+        *e->real_slot = (void*)(uintptr_t)real_addr;
+    return (u64)(uintptr_t)e->hook_fn;
 }
 
 u32 hooksLookupNextForCompat(uintptr_t* out_addr, const char* sym_name) {
     if (!out_addr || !sym_name || !sym_name[0])
         return MAKERESULT(22, 5); // 0xa16 (nn::ro SymbolNotFound)
-    if (strcmp(sym_name, "_ZN2nn2os20GetMemoryHeapAddressEv") == 0) {
-        *out_addr = (uintptr_t)hook_GetMemoryHeapAddress;
-        return 0;
-    }
-    if (strcmp(sym_name, "_ZN2nn2os17GetMemoryHeapSizeEv") == 0) {
-        *out_addr = (uintptr_t)hook_GetMemoryHeapSize;
-        return 0;
-    }
 
-    // Resolve strictly AFTER the calling module (compat1 -> compat2/sdk, compat2 -> sdk)
-    // so compat2 can never look up itself or recurse into a passthrough hook!
+    // 1. Pure original-symbol lookup strictly AFTER the calling module
+    //    (compat1 -> compat2/sdk, compat2 -> sdk). Never returns caller or passthrough hooks.
     const u64 caller = (u64)(uintptr_t)__builtin_return_address(0);
     const char* caller_mod = "?";
     const char* found_mod = "?";
-    u64 addr = elfFindSymbolAfterAddr(&g_mods, caller, sym_name, &caller_mod, &found_mod);
+    u64 orig_addr = elfFindSymbolAfterAddr(&g_mods, caller, sym_name, &caller_mod, &found_mod);
+
+    // 2. Apply unified provider registry ONLY for entries marked terminal_for_compat.
+    bool is_terminal = false;
+    const HookProviderKind prov = hooksQueryProvider(sym_name, &is_terminal);
+    u64 addr = orig_addr;
     bool used_hook = false;
-    if (is_terminal_compat_hook(sym_name)) {
-        const u64 hooked = hooksResolve(sym_name, addr);
+    if (prov != HOOK_PROV_NONE && is_terminal) {
+        const u64 hooked = hooksResolve(sym_name, orig_addr);
         if (hooked) {
             addr = hooked;
             used_hook = true;
