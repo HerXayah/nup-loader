@@ -9,56 +9,11 @@
 
 #define NUP_MAX_EXEFS_FILES 24
 #define NUP_MAX_NAME 64
-#define NUP_MAX_ROMFS_LAYERS 8
 
 typedef struct {
     char name[NUP_MAX_NAME + 1];
     u64 size;
-    u64 offset;
-    u64 comp_size;
-    u8 codec;
 } NupFileInfo;
-
-typedef struct {
-    u64 title_id;
-    u32 root_dir_idx;
-    u32 exefs_dir_idx;
-    u32 romfs_dir_idx;
-    u32 version;
-    u8 kind;
-    u8 flags;
-    u8 pad0[6];
-    u64 meta_off;
-    u32 meta_size;
-    u32 pad1;
-    u64 reserved[2];
-} NupPartEntry;
-
-_Static_assert(sizeof(NupPartEntry) == 0x40, "NupPartEntry size");
-
-typedef struct {
-    u32 name_off;
-    u32 name_len;
-    u32 first_child;
-    u32 child_count;
-    u32 reserved0;
-    u32 reserved1;
-} NupDirEntry;
-
-_Static_assert(sizeof(NupDirEntry) == 0x18, "NupDirEntry size");
-
-typedef struct {
-    u32 name_off;
-    u32 name_len;
-    u64 size;
-    u64 data_off;
-    u64 comp_size;
-    u8 sha256[32];
-    u8 codec;
-    u8 pad0[15];
-} NupFileEntry;
-
-_Static_assert(sizeof(NupFileEntry) == 0x50, "NupFileEntry size");
 
 typedef struct {
     volatile int locked;
@@ -272,55 +227,19 @@ static inline Result nupRawDirGetEntryCount(FsDir* d, s64* out_cnt) {
 }
 
 typedef struct {
-    bool is_raw;
+    bool open;
     bool raw_is_subprogram;
     FsFileSystem* raw_sd;
     char raw_app_root[0x300];
     char raw_root[0x300];
     char raw_romfs_root[0x300];
-
-    FsFile file;
-    bool open;
-    NupSpinLock io_lock;
-
-    u64 toc_off;
-    u64 toc_size;
-    u32 part_count;
-    u64 dir_count;
-    u64 file_count;
-    u64 str_off;
-    u64 str_size;
     u64 title_id;
-
-    u8* toc_buf;
-    const NupPartEntry* parts;
-    const NupDirEntry* dirs;
-    const NupFileEntry* files;
-    const u32* children;
-    const char* strings;
-    u32 romfs_dir_idx;
-    u32 romfs_dirs[NUP_MAX_ROMFS_LAYERS];
-    u32 romfs_layer_count;
     bool has_romfs;
-    u32 dlc_dir_idx;
-    bool has_dlc;
 } NupArchive;
 
-const char* nupLastProbeError(void);
-
-bool nupProbe(FsFileSystem* sd, const char* path, u64* out_title_id,
-              NupFileInfo* out_exefs, u32* out_exefs_count);
 bool nupProbeRaw(FsFileSystem* sd, const char* dir_path, u64* out_title_id,
                  NupFileInfo* out_exefs, u32* out_exefs_count);
-Result nupOpenFull(NupArchive* nup, FsFileSystem* sd, const char* path);
 Result nupOpenRaw(NupArchive* nup, FsFileSystem* sd, const char* dir_path);
 void nupClose(NupArchive* nup);
-bool nupLookupInDir(const NupArchive* nup, u32 root_dir_idx, const char* rel_path,
-                    bool* out_is_dir, u32* out_idx);
-bool nupLookupRomfs(const NupArchive* nup, const char* rel_path,
-                    bool* out_is_dir, u32* out_idx);
-Result nupReadFile(NupArchive* nup, u32 file_idx, s64 offset, void* dst,
-                   size_t size, size_t* out_read);
-Result nupReadRaw(NupArchive* nup, u64 offset, void* dst, size_t size);
 Result nupReadExefs(NupArchive* nup, const NupFileInfo* fi, u64 offset, void* dst, size_t size);
 void nupFormatRawRomPath(const NupArchive* nup, const char* rel_path, char* out, size_t out_sz);

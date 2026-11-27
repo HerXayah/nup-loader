@@ -91,3 +91,9 @@ u64 elfFindSymbolAfterAddr(const ModuleSet* set, u64 caller_addr, const char* na
 const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off);
 void elfLogMatchingSymbols(const ModuleSet* set, const char* substr);
 void elfRunInitArrays(const ModuleSet* set, void (*after_sdk_cb)(void));
+
+// Dynamically scans an in-memory NRO image (prior to ldr:ro LoadNro) and patches
+// any `svc #n` (except 0x36) into thunks targeting nup_svc_entry using trailing
+// .text padding. Returns the number of patched SVC sites.
+u32 elfPatchNroSvcs(u8* nro_buf, u64 nro_size, const char* tag);
+u32 elfGetSdkSvc29Off(void);

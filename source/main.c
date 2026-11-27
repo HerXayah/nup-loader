@@ -13,13 +13,25 @@
 #include "elf_loader.h"
 #include "hooks.h"
 #include "log.h"
+#include "native_boot.h"
 #include "nup.h"
+#include "nupvfs_proto.h"
+#include "svc_hipc.h"
 #include "trace.h"
 #include "ui.h"
+#include "vfs_romfs.h"
 
-#define NUP_BUILD_TAG "0325-cap41"
+#define NUP_BUILD_TAG "0325-cap47"
 
-// Keep libnx's own heap compact (256 MiB: enough for NUP TOC + NSO staging)
+static bool g_romfs_ui_printed = false;
+
+static void romfs_progress_ui(u32 dirs, u32 files) {
+    printf("\r  [4/6] Indexing RomFS: %u dirs, %u files...   ", dirs, files);
+    consoleUpdate(NULL);
+    g_romfs_ui_printed = true;
+}
+
+// Keep libnx's own heap compact (256 MiB: enough for NSO staging)
 // so ~5.8 GiB remains free for the launched game's heap and GPU/virtual memory.
 size_t __nx_heap_size = 0x10000000;
 
@@ -81,10 +93,8 @@ static void shrink_libnx_heap_for_game(void) {
     svcGetInfo(&used_before, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
 
     u64 high = heap_base;
-    if (g_nup.toc_buf) {
-        const u64 toc_end = (u64)(uintptr_t)g_nup.toc_buf + g_nup.toc_size;
-        if (toc_end > high) high = toc_end;
-    }
+    const u64 romfs_hi = nupSvcHipcMaxHeapAddr();
+    if (romfs_hi > high) high = romfs_hi;
     for (u32 i = 0; i < g_mods.count; i++) {
         if (g_mods.mods[i].src_buf) {
             const u64 sz = g_mods.mods[i].src_size ? g_mods.mods[i].src_size : g_mods.mods[i].total_size;
@@ -115,6 +125,8 @@ static void shrink_libnx_heap_for_game(void) {
         keep = ((high - heap_base) + 0x400000ull + 0x1fffffull) & ~0x1fffffull;
     void* shrunk_base = NULL;
     const Result shrink_rc = svcSetHeapSize(&shrunk_base, (size_t)keep);
+    if (R_SUCCEEDED(shrink_rc))
+        nupSvcHipcSetHostHeap((u64)(uintptr_t)shrunk_base, keep);
     u64 used_after = 0;
     svcGetInfo(&used_after, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
     nupLogf("[5/6] heap shrink: heap_base=0x%llx high=0x%llx keep=0x%llx rc=0x%x used: 0x%llx -> 0x%llx (total=0x%llx)\n",
@@ -134,30 +146,18 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
     snprintf(audit_path, sizeof(audit_path), "/kaihen/audits/%016llx.txt",
              (unsigned long long)entry->title_id);
     nupLogInit(&g_sd, audit_path);
-    nupLogf("=== nup-loader [build=" NUP_BUILD_TAG "] STATIC AUDIT: %s (tid=%016llx, %s) ===\n",
-            entry->path, (unsigned long long)entry->title_id,
-            entry->is_raw ? "RAW" : "NUP");
+    nupLogf("=== nup-loader [build=" NUP_BUILD_TAG "] STATIC AUDIT: %s (tid=%016llx, RAW) ===\n",
+            entry->path, (unsigned long long)entry->title_id);
 
     NupFileInfo exefs[NUP_MAX_EXEFS_FILES];
     u32 exefs_count = 0;
-    Result rc = 0;
-    if (entry->is_raw) {
-        if (!nupProbeRaw(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
-            nupLogf("[!] nupProbeRaw failed\n");
-            nupLogClose();
-            snprintf(out_status, out_status_sz, "audit failed: probe raw");
-            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-        }
-        rc = nupOpenRaw(&g_nup, &g_sd, entry->path);
-    } else {
-        if (!nupProbe(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
-            nupLogf("[!] nupProbe failed\n");
-            nupLogClose();
-            snprintf(out_status, out_status_sz, "audit failed: probe nup");
-            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-        }
-        rc = nupOpenFull(&g_nup, &g_sd, entry->path);
+    if (!nupProbeRaw(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
+        nupLogf("[!] nupProbeRaw failed\n");
+        nupLogClose();
+        snprintf(out_status, out_status_sz, "audit failed: probe raw");
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
+    Result rc = nupOpenRaw(&g_nup, &g_sd, entry->path);
     if (R_FAILED(rc)) {
         nupLogf("[!] open failed: 0x%x\n", rc);
         nupLogClose();
@@ -202,6 +202,43 @@ static Result audit_nup(const NupEntry* entry, char* out_status, size_t out_stat
 }
 
 static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) {
+    Handle hen_sm = INVALID_HANDLE;
+    Handle vfs_h = INVALID_HANDLE;
+    NupVfsInfo vfs_info = {};
+    bool vfs_active = false;
+    {
+        Service ro = {}, hen = {};
+        if (R_SUCCEEDED(kaihenGetRoSession(&ro)) &&
+            R_SUCCEEDED(kaihenOpenHomebrewSession(&ro, &hen))) {
+            henGetServiceManager(&hen, &hen_sm);
+            HenPluginName pname = {};
+            snprintf(pname.name, sizeof(pname.name), "%s", NUPVFS_PLUGIN_NAME);
+            Service vfs = {};
+            if (R_SUCCEEDED(henOpenPlugin(&hen, &pname, &vfs))) {
+                if (R_SUCCEEDED(serviceDispatchOut(&vfs, NupVfsCmd_GetInfo, vfs_info)) &&
+                    vfs_info.magic == NUPVFS_MAGIC) {
+                    vfs_h = vfs.session;
+                    vfs_active = true;
+                    if (!trace_mode && (vfs_info.flags & NUPVFS_FLAG_TRACE))
+                        trace_mode = true;
+                } else {
+                    serviceClose(&vfs);
+                }
+            }
+            serviceClose(&hen);
+        }
+    }
+    nupSvcHipcSetVfsPlugin(vfs_h, vfs_active ? vfs_info.flags : (NUPVFS_FLAG_MODS | NUPVFS_FLAG_CACHE));
+
+    if (vfs_active && (vfs_info.flags & NUPVFS_FLAG_NATIVE)) {
+        char msg[0x100] = {};
+        if (R_SUCCEEDED(nupArmNativeLoaderBoot(&g_sd, entry, msg, sizeof(msg)))) {
+            if (vfs_h != INVALID_HANDLE) svcCloseHandle(vfs_h);
+            if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
+            return 0;
+        }
+    }
+
     nupDiagReset();
     nupTraceReset(trace_mode);
 
@@ -225,17 +262,15 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         consoleUpdate(NULL);
     }
 
-    Handle hen_sm = INVALID_HANDLE;
-    Service ro = {}, hen = {};
-    if (R_SUCCEEDED(kaihenGetRoSession(&ro)) &&
-        R_SUCCEEDED(kaihenOpenHomebrewSession(&ro, &hen))) {
-        henGetServiceManager(&hen, &hen_sm);
-        serviceClose(&hen);
-    }
-    nupLogf("[1/6] hen_sm=%s\n", hen_sm != INVALID_HANDLE ? "ready" : "unavailable");
+    nupLogf("[1/6] hen_sm=%s nupvfs=%s (slots=%u flags=0x%x cbtn=%u rc=0x%x)\n",
+            hen_sm != INVALID_HANDLE ? "ready" : "unavailable",
+            vfs_active ? "ACTIVE" : "fallback-local",
+            vfs_info.slot_count, vfs_info.flags, vfs_info.cbutton_events, vfs_info.cbutton_rc);
     nupDiagDumpLatestErpt(hen_sm, &g_sd);
     if (!headless) {
-        printf("  [1/6] HEN SM proxy: %s\n", hen_sm != INVALID_HANDLE ? "ready" : "unavailable");
+        printf("  [1/6] HEN SM proxy: %s | nupvfs: %s\n",
+               hen_sm != INVALID_HANDLE ? "ready" : "unavailable",
+               vfs_active ? "resident plugin" : "local fallback");
         consoleUpdate(NULL);
     }
 
@@ -247,51 +282,31 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
 
     NupFileInfo exefs[NUP_MAX_EXEFS_FILES];
     u32 exefs_count = 0;
-    if (entry->is_raw) {
-        if (!nupProbeRaw(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
-            nupLogf("[!] nupProbeRaw failed\n");
-            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-        }
-        if (!headless) { printf("  [2/6] Opening raw folder %s...\n", entry->path); consoleUpdate(NULL); }
-        rc = nupOpenRaw(&g_nup, &g_sd, entry->path);
-        if (R_FAILED(rc)) {
-            nupLogf("[!] nupOpenRaw failed: 0x%x\n", rc);
-            return rc;
-        }
-        nupLogf("[2/6] RAW opened: %s exefs=%u romfs=%d (%s) app_root=%s\n",
-                entry->path, exefs_count, g_nup.has_romfs ? 1 : 0,
-                g_nup.raw_romfs_root[0] ? g_nup.raw_romfs_root : "none",
-                g_nup.raw_app_root);
-    } else {
-        if (!nupProbe(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
-            nupLogf("[!] nupProbe failed\n");
-            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-        }
-        if (!headless) { printf("  [2/6] Loading NUP TOC into RAM...\n"); consoleUpdate(NULL); }
-        rc = nupOpenFull(&g_nup, &g_sd, entry->path);
-        if (R_FAILED(rc)) {
-            nupLogf("[!] nupOpenFull failed: 0x%x\n", rc);
-            return rc;
-        }
-        nupLogf("[2/6] TOC loaded: parts=%u dirs=%llu files=%llu romfs_layers=%u sel_tid=%016llx\n",
-                g_nup.part_count, (unsigned long long)g_nup.dir_count,
-                (unsigned long long)g_nup.file_count, g_nup.romfs_layer_count,
-                (unsigned long long)g_nup.title_id);
-        for (u32 pi = 0; pi < g_nup.part_count && pi < 16; pi++) {
-            const NupPartEntry* pe = &g_nup.parts[pi];
-            nupLogf("  part[%u]: tid=%016llx kind=%u flags=0x%x ver=%u exefs=%u romfs=%u\n",
-                    pi, (unsigned long long)pe->title_id, pe->kind, pe->flags,
-                    pe->version, pe->exefs_dir_idx, pe->romfs_dir_idx);
-        }
+    if (!nupProbeRaw(&g_sd, entry->path, NULL, exefs, &exefs_count)) {
+        nupLogf("[!] nupProbeRaw failed\n");
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
+    if (!headless) { printf("  [2/6] Opening raw folder %s...\n", entry->path); consoleUpdate(NULL); }
+    rc = nupOpenRaw(&g_nup, &g_sd, entry->path);
+    if (R_FAILED(rc)) {
+        nupLogf("[!] nupOpenRaw failed: 0x%x\n", rc);
+        return rc;
+    }
+    nupLogf("[2/6] RAW opened: %s exefs=%u romfs=%d (%s) app_root=%s\n",
+            entry->path, exefs_count, g_nup.has_romfs ? 1 : 0,
+            g_nup.raw_romfs_root[0] ? g_nup.raw_romfs_root : "none",
+            g_nup.raw_app_root);
 
     if (!headless) { printf("  [3/6] Mapping ExeFS NSOs via ldr:ro...\n"); consoleUpdate(NULL); }
     rc = elfLoadNupModules(&g_mods, &g_nup, exefs, exefs_count);
     if (R_FAILED(rc)) {
         nupLogf("[!] elfLoadNupModules failed: 0x%x\n", rc);
+        nupLogFlush();
         nupClose(&g_nup);
         return rc;
     }
+    nupLogf("[3/6] ExeFS mapped: %u modules\n", g_mods.count);
+    nupLogFlush();
 
     const u64 sel_tid = g_nup.title_id ? g_nup.title_id : entry->title_id;
     elfAttachSwitch1Compat(&g_mods, sel_tid);
@@ -302,12 +317,21 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         nupLogRuntimeCaps(&caps);
         elfRunStaticAudit(&g_mods, &caps, hooksResolve, NULL);
     }
-    if (!headless) { printf("  [4/6] Relocating %u modules & applying compatibility providers...\n", g_mods.count); consoleUpdate(NULL); }
+    if (!headless) { printf("  [4/6] Indexing RomFS & preparing VFS...\n"); consoleUpdate(NULL); }
+    nupLogf("[4/6] hooksInit start...\n");
+    g_romfs_ui_printed = false;
+    vfsRomfsSetProgressCallback(headless ? NULL : romfs_progress_ui);
     hooksInit(&g_nup, &g_sd, &caps, hen_sm);
+    vfsRomfsSetProgressCallback(NULL);
+    if (!headless && g_romfs_ui_printed) { printf("\n"); consoleUpdate(NULL); }
+    if (!headless) { printf("  [4/6] Relocating %u modules...\n", g_mods.count); consoleUpdate(NULL); }
+    nupLogf("[4/6] VFS/hooks ready, relocating %u modules...\n", g_mods.count);
+    nupLogFlush();
     u32 unresolved = 0;
     rc = elfRelocateAll(&g_mods, hooksResolve, &unresolved);
     if (R_FAILED(rc)) {
         nupLogf("[!] elfRelocateAll failed: 0x%x\n", rc);
+        nupLogFlush();
         return rc;
     }
 
@@ -353,6 +377,50 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     appletExit();
 
     log_host_process_info();
+    // Self-test patched SVC #0x29 thunk in sdk BEFORE clearing TLS or calling nn::init::Start
+    {
+        const u32 svc29_off = elfGetSdkSvc29Off();
+        const LoadedModule* sdk_mod = NULL;
+        for (u32 i = 0; i < g_mods.count; i++) {
+            if (strcmp(g_mods.mods[i].name, "sdk") == 0) { sdk_mod = &g_mods.mods[i]; break; }
+        }
+        if (sdk_mod) {
+            MemoryInfo mi0 = {}, mi1 = {}, mi2 = {};
+            u32 pi = 0;
+            svcQueryMemory(&mi0, &pi, sdk_mod->nro_base);
+            svcQueryMemory(&mi1, &pi, sdk_mod->nso_base);
+            extern void nup_svc_entry(void);
+            svcQueryMemory(&mi2, &pi, (u64)(uintptr_t)nup_svc_entry);
+            nupLogf("[self-test] sdk.nro=%016llx(t=%u p=%u sz=0x%llx) sdk.nso=%016llx(t=%u p=%u) entry=%016llx(t=%u p=%u)\n",
+                    (unsigned long long)sdk_mod->nro_base, mi0.type, mi0.perm, (unsigned long long)mi0.size,
+                    (unsigned long long)sdk_mod->nso_base, mi1.type, mi1.perm,
+                    (unsigned long long)(uintptr_t)nup_svc_entry, mi2.type, mi2.perm);
+            if (svc29_off >= 8 && (mi1.perm & Perm_R)) {
+                const u32* w = (const u32*)(uintptr_t)(sdk_mod->nso_base + svc29_off - 8);
+                nupLogf("[self-test] sdk+0x%x words: %08x %08x %08x %08x %08x %08x\n",
+                        svc29_off - 8, w[0], w[1], w[2], w[3], w[4], w[5]);
+                const u64 fn_addr = (w[0] == 0xD503245Fu && w[1] == 0xF81F0FE0u)
+                    ? (sdk_mod->nso_base + svc29_off - 8)
+                    : (w[1] == 0xF81F0FE0u ? (sdk_mod->nso_base + svc29_off - 4) : 0);
+                if (fn_addr) {
+                    nupLogf("[self-test] invoking patched sdk svcGetInfo @ %016llx...\n",
+                            (unsigned long long)fn_addr);
+                    typedef Result (*SdkGetInfoFn)(u64*, u32, Handle, u64);
+                    u64 out_val = 0;
+                    const Result trc = ((SdkGetInfoFn)(uintptr_t)fn_addr)(
+                        &out_val, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+                    nupLogf("[self-test] patched sdk svcGetInfo OK! rc=0x%x val=0x%llx\n",
+                            trc, (unsigned long long)out_val);
+                }
+            }
+            if (init_start_addr && (mi1.perm & Perm_R)) {
+                const u32* iw = (const u32*)(uintptr_t)init_start_addr;
+                nupLogf("[self-test] nn::init::Start @ %016llx words: %08x %08x %08x %08x\n",
+                        (unsigned long long)init_start_addr, iw[0], iw[1], iw[2], iw[3]);
+            }
+        }
+    }
+    nupLogSetPersistentHandle(true);
     nupDiagStartHeartbeat();
     shrink_libnx_heap_for_game();
 
@@ -434,13 +502,15 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     return 0;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     if (R_SUCCEEDED(fsOpenSdCardFileSystem(&g_sd)))
         g_sd_open = true;
 
     NupEntry auto_entry = {};
     bool auto_trace = false;
-    if (g_sd_open && nupUiReadAutolaunch(&g_sd, &auto_entry, &auto_trace)) {
+    if (g_sd_open &&
+        (nupUiProbeArgv(&g_sd, argc, argv, &auto_entry, &auto_trace) ||
+         nupUiReadAutolaunch(&g_sd, &auto_entry, &auto_trace))) {
         launch_nup(&auto_entry, true, auto_trace);
         fsFsClose(&g_sd);
         return 0;
@@ -489,6 +559,14 @@ int main(void) {
 
         if ((down & HidNpadButton_L) && g_entry_count > 0) {
             audit_nup(&g_entries[g_cursor], status, sizeof(status));
+            nupUiDrawMenu(g_entries, g_entry_count, g_cursor, status, g_skip_note);
+            continue;
+        }
+
+        if ((down & HidNpadButton_R) && g_entry_count > 0) {
+            snprintf(status, sizeof(status), "Packing /kaihen/bin/game/next.nsp for Native Loader Boot...");
+            nupUiDrawMenu(g_entries, g_entry_count, g_cursor, status, g_skip_note);
+            nupArmNativeLoaderBoot(&g_sd, &g_entries[g_cursor], status, sizeof(status));
             nupUiDrawMenu(g_entries, g_entry_count, g_cursor, status, g_skip_note);
             continue;
         }

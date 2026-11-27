@@ -41,14 +41,39 @@ struct _reent* __wrap___syscall_getreent(void) {
 #define LOG_RING_SIZE 65536u
 
 static FsFileSystem* g_log_sd = NULL;
+static char g_log_path[FS_MAX_PATH] = {};
 static FsFile g_log_file = {};
 static bool g_log_open = false;
+static bool g_log_handle_open = false;
+static bool g_log_persistent = false;
 static s64 g_log_pos = 0;
 static NupSpinLock g_log_lock;
 
 static char g_ring[LOG_RING_SIZE];
 static u32 g_ring_head = 0;
 static u32 g_ring_count = 0;
+
+static bool log_write_raw_locked(const char* data, size_t len) {
+    if (!g_log_open || !g_log_sd || len == 0)
+        return false;
+    if (g_log_handle_open) {
+        if (R_FAILED(nupRawFileWrite(&g_log_file, g_log_pos, data, len, FsWriteOption_Flush)))
+            return false;
+        g_log_pos += (s64)len;
+        nupRawFsCommit(g_log_sd);
+        return true;
+    }
+    FsFile f = {};
+    if (R_FAILED(nupRawFsOpenFile(g_log_sd, g_log_path, FsOpenMode_Write | FsOpenMode_Append, &f)))
+        return false;
+    const Result rc = nupRawFileWrite(&f, g_log_pos, data, len, FsWriteOption_Flush);
+    serviceClose(&f.s);
+    if (R_FAILED(rc))
+        return false;
+    g_log_pos += (s64)len;
+    nupRawFsCommit(g_log_sd);
+    return true;
+}
 
 static void ring_append_locked(const char* data, u32 len) {
     if (len == 0)
@@ -76,27 +101,23 @@ static void ring_append_locked(const char* data, u32 len) {
 static void ring_flush_locked(void) {
     if (!g_log_open || g_ring_count == 0)
         return;
-    bool wrote = false;
     while (g_ring_count > 0) {
         u32 chunk = LOG_RING_SIZE - g_ring_head;
         if (chunk > g_ring_count) chunk = g_ring_count;
-        if (R_FAILED(nupRawFileWrite(&g_log_file, g_log_pos,
-                                     g_ring + g_ring_head, chunk, FsWriteOption_Flush))) {
+        if (!log_write_raw_locked(g_ring + g_ring_head, chunk))
             break;
-        }
-        g_log_pos += (s64)chunk;
         g_ring_head = (g_ring_head + chunk) % LOG_RING_SIZE;
         g_ring_count -= chunk;
-        wrote = true;
     }
-    if (wrote)
-        nupRawFsCommit(g_log_sd);
 }
 
 void nupLogInit(FsFileSystem* sd, const char* path) {
     nupSpinInit(&g_log_lock);
     g_log_sd = sd;
+    g_log_path[0] = '\0';
     g_log_open = false;
+    g_log_handle_open = false;
+    g_log_persistent = false;
     g_log_pos = 0;
     g_ring_head = 0;
     g_ring_count = 0;
@@ -118,13 +139,28 @@ void nupLogInit(FsFileSystem* sd, const char* path) {
             }
         }
     }
+    snprintf(g_log_path, sizeof(g_log_path), "%s", path);
     fsFsDeleteFile(sd, path);
     if (R_FAILED(fsFsCreateFile(sd, path, 0, 0)))
         return;
-    if (R_FAILED(fsFsOpenFile(sd, path, FsOpenMode_Write | FsOpenMode_Append, &g_log_file)))
-        return;
     g_log_open = true;
     fsFsCommit(sd);
+}
+
+void nupLogSetPersistentHandle(bool keep_open) {
+    nupSpinLock(&g_log_lock);
+    if (g_log_open) {
+        ring_flush_locked();
+        if (keep_open && !g_log_handle_open) {
+            if (R_SUCCEEDED(nupRawFsOpenFile(g_log_sd, g_log_path, FsOpenMode_Write | FsOpenMode_Append, &g_log_file)))
+                g_log_handle_open = true;
+        } else if (!keep_open && g_log_handle_open) {
+            serviceClose(&g_log_file.s);
+            g_log_handle_open = false;
+        }
+        g_log_persistent = keep_open;
+    }
+    nupSpinUnlock(&g_log_lock);
 }
 
 void nupLogBufferedf(const char* fmt, ...) {
@@ -163,10 +199,7 @@ void nupLogf(const char* fmt, ...) {
     va_end(ap);
     if (n > 0 && g_log_open) {
         const size_t len = (size_t)n < sizeof(buf) ? (size_t)n : (sizeof(buf) - 1);
-        if (R_SUCCEEDED(nupRawFileWrite(&g_log_file, g_log_pos, buf, len, FsWriteOption_Flush))) {
-            g_log_pos += (s64)len;
-            nupRawFsCommit(g_log_sd);
-        }
+        log_write_raw_locked(buf, len);
     }
     nupSpinUnlock(&g_log_lock);
 }
@@ -175,8 +208,11 @@ void nupLogClose(void) {
     nupSpinLock(&g_log_lock);
     if (g_log_open) {
         ring_flush_locked();
-        fsFileFlush(&g_log_file);
-        fsFileClose(&g_log_file);
+        if (g_log_handle_open) {
+            fsFileFlush(&g_log_file);
+            fsFileClose(&g_log_file);
+            g_log_handle_open = false;
+        }
         fsFsCommit(g_log_sd);
         g_log_open = false;
     }

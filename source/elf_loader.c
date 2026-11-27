@@ -202,6 +202,204 @@ static bool parse_mod0(LoadedModule* mod) {
     return true;
 }
 
+extern void nup_svc_entry(void);
+static u32 g_sdk_svc29_off = 0;
+
+u32 elfGetSdkSvc29Off(void) {
+    return g_sdk_svc29_off;
+}
+
+// Patch ONLY the 8 SVCs that nupSvcDispatch actually intercepts.
+// Leaving all other SVCs (e.g. svcReturnFromException, svcBreak, svcArbitrateLock,
+// svcQueryMemory, svcExitThread, Switch 2 extended SVCs) untouched keeps them
+// 100% native with zero thunk overhead and zero risk to exception/thread handling.
+static bool should_patch_svc(u32 imm) {
+    switch (imm) {
+    case 0x01u: // svcSetHeapSize
+    case 0x16u: // svcCloseHandle
+    case 0x18u: // svcWaitSynchronization
+    case 0x1Fu: // svcConnectToNamedPort
+    case 0x21u: // svcSendSyncRequest
+    case 0x22u: // svcSendSyncRequestWithUserBuffer
+    case 0x29u: // svcGetInfo
+    case 0x2Cu: // svcMapPhysicalMemory
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool patch_nso_svcs(u8* buf, u32 text_sz, u32 ro_off, const char* name) {
+    const u64 shift = 0x1000ull;
+    u32 count = 0;
+
+    for (u32 off = 0; off + 4 <= text_sz; off += 4) {
+        u32 w = 0;
+        memcpy(&w, buf + shift + off, 4);
+        if ((w & 0xFFE0001Fu) != 0xD4000001u)
+            continue;
+        const u32 imm = (w >> 5) & 0xFFFFu;
+        if (!should_patch_svc(imm))
+            continue;
+        count++;
+    }
+
+    if (count == 0)
+        return true;
+
+    // ldr:ro maps NRO page 0 ([0..0x1000)) as R-- (Perm_R, non-executable) and
+    // [0x1000..0x1000+ro_off) as R-X (Perm_R|Perm_X). Place all SVC thunks +
+    // entry literal inside the trailing executable slack of .text before ro_off.
+    const u64 need = (u64)count * 24ull + 8ull;
+    u64 thunk_base = (shift + (u64)text_sz + 7ull) & ~7ull;
+    if (thunk_base + need > shift + (u64)ro_off) {
+        // text_sz was page-aligned to ro_off: scan backwards for trailing zero padding
+        u64 code_end = shift + (u64)ro_off;
+        while (code_end > shift + 0x80ull) {
+            u32 prev = 0;
+            memcpy(&prev, buf + code_end - 4, 4);
+            if (prev != 0)
+                break;
+            code_end -= 4;
+        }
+        thunk_base = (code_end + 16ull + 7ull) & ~7ull;
+    }
+    const u64 lit = thunk_base + (u64)count * 24ull;
+    if (lit + 8ull > shift + (u64)ro_off) {
+        nupLogf("[svc-patch] %s: %u SVC(s) need %lluB but only %lluB slack in .text (ts=0x%x rm=0x%x)\n",
+                name, count, (unsigned long long)need,
+                (unsigned long long)(shift + (u64)ro_off > thunk_base ? (shift + (u64)ro_off - thunk_base) : 0ull),
+                text_sz, ro_off);
+        return false;
+    }
+
+    u32 idx = 0;
+    char sites_log[256] = {};
+    size_t spos = 0;
+    for (u32 off = 0; off + 4 <= text_sz; off += 4) {
+        u32 w = 0;
+        memcpy(&w, buf + shift + off, 4);
+        if ((w & 0xFFE0001Fu) != 0xD4000001u)
+            continue;
+        const u32 imm = (w >> 5) & 0xFFFFu;
+        if (!should_patch_svc(imm))
+            continue;
+
+        const u64 site = shift + off;
+        const u64 here = thunk_base + (u64)idx++ * 24ull;
+        const s64 dist = (s64)here - (s64)site;
+        if (dist >= 0x8000000ll || dist < -0x8000000ll) {
+            nupLogf("[svc-patch] %s: SVC #0x%x at +0x%x out of branch range\n", name, imm, off);
+            return false;
+        }
+
+        u32 t[6];
+        t[0] = 0xA9BF7BF0u;                                                        // stp x16, x30, [sp, #-16]!
+        t[1] = 0x52800010u | (imm << 5);                                           // mov w16, #imm
+        t[2] = 0x5800001Eu | (u32)((((s64)lit - (s64)(here + 8)) / 4) << 5);       // ldr x30, literal
+        t[3] = 0xD63F03C0u;                                                        // blr x30
+        t[4] = 0xA8C17BF0u;                                                        // ldp x16, x30, [sp], #16
+        t[5] = 0x14000000u | (u32)((((s64)(site + 4) - (s64)(here + 20)) / 4) & 0x3FFFFFFu); // b site+4
+        memcpy(buf + here, t, sizeof(t));
+
+        const u32 b_insn = 0x14000000u | (u32)((dist / 4) & 0x3FFFFFFu);
+        memcpy(buf + site, &b_insn, 4);
+        if (imm == 0x29u && strcmp(name, "sdk") == 0)
+            g_sdk_svc29_off = off;
+
+        if (spos + 20 < sizeof(sites_log)) {
+            int n = snprintf(sites_log + spos, sizeof(sites_log) - spos, " 0x%02x@+0x%x", imm, off);
+            if (n > 0) spos += (size_t)n;
+        }
+    }
+
+    const u64 entry_addr = (u64)(uintptr_t)nup_svc_entry;
+    memcpy(buf + lit, &entry_addr, 8);
+
+    nupLogf("[svc-patch] %s: patched %u SVC site(s) (thunks=nso+0x%llx entry=%p):%s\n",
+            name, count, (unsigned long long)(thunk_base - shift), (void*)(uintptr_t)entry_addr, sites_log);
+    return true;
+}
+
+u32 elfPatchNroSvcs(u8* nro_buf, u64 nro_size, const char* tag) {
+    if (!nro_buf || nro_size < 0x80 || memcmp(nro_buf + 0x10, "NRO0", 4) != 0)
+        return 0;
+    u32 text_off = 0, text_sz = 0, ro_off = 0;
+    memcpy(&text_off, nro_buf + 0x20, 4);
+    memcpy(&text_sz,  nro_buf + 0x24, 4);
+    memcpy(&ro_off,   nro_buf + 0x28, 4);
+    if (text_sz == 0 || (u64)text_off + text_sz > nro_size || ro_off < text_off + text_sz)
+        return 0;
+
+    // Scan for intercepted svc #n instructions after the 0x80-byte NRO header
+    const u32 scan_start = (text_off == 0 && text_sz > 0x80u) ? 0x80u : 0u;
+    u32 count = 0;
+    for (u32 off = scan_start; off + 4 <= text_sz; off += 4) {
+        u32 w = 0;
+        memcpy(&w, nro_buf + text_off + off, 4);
+        if ((w & 0xFFE0001Fu) != 0xD4000001u)
+            continue;
+        const u32 imm = (w >> 5) & 0xFFFFu;
+        if (!should_patch_svc(imm))
+            continue;
+        count++;
+    }
+    if (count == 0)
+        return 0;
+
+    // Find trailing zero-padding at the end of .text before ro_off
+    u32 code_end = text_off + text_sz;
+    while (code_end > text_off + 0x80u) {
+        u32 prev = 0;
+        memcpy(&prev, nro_buf + code_end - 4, 4);
+        if (prev != 0)
+            break;
+        code_end -= 4;
+    }
+    const u64 thunk_base = (code_end + 7ull) & ~7ull;
+    const u64 lit_off = thunk_base + (u64)count * 24ull;
+    if (lit_off + 8ull > (u64)ro_off) {
+        nupLogf("[svc-patch] dynamic NRO '%s': %u SVC(s) found but only %lluB slack in .text\n",
+                tag ? tag : "nro", count, (unsigned long long)((u64)ro_off - thunk_base));
+        return 0;
+    }
+
+    u32 idx = 0;
+    for (u32 off = scan_start; off + 4 <= text_sz; off += 4) {
+        u32 w = 0;
+        memcpy(&w, nro_buf + text_off + off, 4);
+        if ((w & 0xFFE0001Fu) != 0xD4000001u)
+            continue;
+        const u32 imm = (w >> 5) & 0xFFFFu;
+        if (!should_patch_svc(imm))
+            continue;
+
+        const u64 site = (u64)text_off + off;
+        const u64 here = thunk_base + (u64)idx++ * 24ull;
+        const s64 dist = (s64)here - (s64)site;
+        if (dist >= 0x8000000ll || dist < -0x8000000ll)
+            continue;
+
+        u32 t[6];
+        t[0] = 0xA9BF7BF0u;                                                        // stp x16, x30, [sp, #-16]!
+        t[1] = 0x52800010u | (imm << 5);                                           // mov w16, #imm
+        t[2] = 0x5800001Eu | (u32)((((s64)lit_off - (s64)(here + 8)) / 4) << 5);   // ldr x30, literal
+        t[3] = 0xD63F03C0u;                                                        // blr x30
+        t[4] = 0xA8C17BF0u;                                                        // ldp x16, x30, [sp], #16
+        t[5] = 0x14000000u | (u32)((((s64)(site + 4) - (s64)(here + 20)) / 4) & 0x3FFFFFFu);
+        memcpy(nro_buf + here, t, sizeof(t));
+
+        const u32 b_insn = 0x14000000u | (u32)((dist / 4) & 0x3FFFFFFu);
+        memcpy(nro_buf + site, &b_insn, 4);
+    }
+
+    const u64 entry_addr = (u64)(uintptr_t)nup_svc_entry;
+    memcpy(nro_buf + lit_off, &entry_addr, 8);
+    nupLogf("[svc-patch] dynamic NRO '%s': patched %u SVC site(s) in .text slack\n",
+            tag ? tag : "nro", idx);
+    return idx;
+}
+
 static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
                               LoadedModule* out, bool map_executable) {
     memset(out, 0, sizeof(*out));
@@ -313,6 +511,11 @@ static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
     }
 
     if (map_executable) {
+        if (!patch_nso_svcs(buf, ts, rm, fi->name)) {
+            free(buf);
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+
         u8* bss_buf = NULL;
         if (bss_seg_sz) {
             bss_buf = (u8*)memalign(0x1000, (size_t)bss_seg_sz);
@@ -427,6 +630,13 @@ void elfUnloadAuditModules(ModuleSet* set) {
     memset(set, 0, sizeof(*set));
 }
 
+static u32 gnu_elf_hash(const char* name) {
+    u32 h = 5381u;
+    for (const unsigned char* p = (const unsigned char*)name; *p; p++)
+        h = (h << 5) + h + *p;
+    return h;
+}
+
 static u32 sysv_elf_hash(const char* name) {
     u32 h = 0;
     for (const unsigned char* p = (const unsigned char*)name; *p; p++) {
@@ -442,6 +652,43 @@ static u64 lookup_in_module(const LoadedModule* mod, const char* name, bool* out
     if (!mod || !mod->symtab || !mod->strtab || !name || !name[0])
         return 0;
     const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
+    if (mod->gnu_hash_off && (mod->gnu_hash_off & 7u) == 0 &&
+        mod->gnu_hash_off + 16u <= mod->total_size) {
+        const u32* gh = (const u32*)((const u8*)(uintptr_t)mod->nso_base + mod->gnu_hash_off);
+        const u32 nbuckets = gh[0];
+        const u32 symoffset = gh[1];
+        const u32 bloom_size = gh[2];
+        const u32 bloom_shift = gh[3];
+        if (nbuckets > 0 && bloom_size > 0 && symoffset <= mod->sym_count) {
+            const u64* bloom = (const u64*)(gh + 4);
+            const u32* buckets = (const u32*)(bloom + bloom_size);
+            const u32* chains = buckets + nbuckets;
+            const u32 hv = gnu_elf_hash(name);
+            const u64 word = bloom[(hv / 64u) % bloom_size];
+            const u64 mask = (1ULL << (hv & 63u)) | (1ULL << ((hv >> bloom_shift) & 63u));
+            if ((word & mask) != mask)
+                return 0;
+            u32 idx = buckets[hv % nbuckets];
+            if (idx < symoffset)
+                return 0;
+            for (; idx < mod->sym_count; idx++) {
+                const u32 ch = chains[idx - symoffset];
+                if (((ch ^ hv) & ~1u) == 0) {
+                    if (syms[idx].st_shndx != 0 && syms[idx].st_value != 0 &&
+                        syms[idx].st_name < mod->strsz &&
+                        ELF64_ST_BIND(syms[idx].st_info) != 0 &&
+                        (syms[idx].st_other & 3) != 1 && (syms[idx].st_other & 3) != 2 &&
+                        strcmp(mod->strtab + syms[idx].st_name, name) == 0) {
+                        if (out_weak) *out_weak = (ELF64_ST_BIND(syms[idx].st_info) == STB_WEAK);
+                        return mod->nso_base + syms[idx].st_value;
+                    }
+                }
+                if (ch & 1u)
+                    break;
+            }
+            return 0;
+        }
+    }
     if (mod->sysv_hash_off) {
         const u32* ht = (const u32*)((const u8*)(uintptr_t)mod->nso_base + mod->sysv_hash_off);
         const u32 nbucket = ht[0];
@@ -1099,6 +1346,9 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
                                 u8* seen_bits, int pass, ElfAuditSummary* sum) {
     if (!table || bytes == 0 || !mod->symtab || !mod->strtab)
         return;
+    const bool is_sdk = (strcmp(mod->name, "sdk") == 0);
+    if (pass > 0 && is_sdk)
+        return;
     const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
     const u64 count = bytes / sizeof(Elf64_Rela);
     for (u64 i = 0; i < count; i++) {
@@ -1119,41 +1369,47 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
         if (!name[0])
             continue;
 
-        const u64 resolved = audit_resolve_sym(set, mod, sym, name);
-        const HookProviderKind prov = hooksQueryProvider(name, NULL);
-        const bool is_hooked = (prov != HOOK_PROV_NONE);
-        const bool is_sdk = (strcmp(mod->name, "sdk") == 0);
-        const bool is_fn = (type == R_AARCH64_JUMP_SLOT) ||
-            (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
-        const bool is_traced = !is_sdk && !is_hooked && resolved && is_fn &&
-                               nupTraceShouldWrap(mod->name, name);
-
         if (pass == 0) {
-            if (!resolved && !is_hooked && ELF64_ST_BIND(sym->st_info) != STB_WEAK) {
+            if (sym->st_shndx != 0 || ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+                continue;
+            if (hooksQueryProvider(name, NULL) != HOOK_PROV_NONE)
+                continue;
+            if (!audit_resolve_sym(set, mod, sym, name)) {
                 sum->unresolved_count++;
                 nupLogBufferedf("  [UNRESOLVED] %-8s %s\n", mod->name, name);
             }
         } else if (pass == 1) {
-            if (!is_sdk && !is_hooked && audit_is_fs_aoc(name)) {
-                sum->unhooked_fs_aoc++;
-                nupLogBufferedf("  [FS/AOC-NATIVE] %-8s %s%s\n", mod->name, name,
-                                is_traced ? " [TRACED]" : "");
-            }
+            if (!audit_is_fs_aoc(name))
+                continue;
+            if (hooksQueryProvider(name, NULL) != HOOK_PROV_NONE)
+                continue;
+            const bool is_fn = (type == R_AARCH64_JUMP_SLOT) ||
+                (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
+            const bool is_traced = is_fn && audit_resolve_sym(set, mod, sym, name) &&
+                                   nupTraceShouldWrap(mod->name, name);
+            sum->unhooked_fs_aoc++;
+            nupLogBufferedf("  [FS/AOC-NATIVE] %-8s %s%s\n", mod->name, name,
+                            is_traced ? " [TRACED]" : "");
         } else if (pass == 2) {
-            if (!is_sdk && is_hooked) {
+            const HookProviderKind prov = hooksQueryProvider(name, NULL);
+            if (prov != HOOK_PROV_NONE) {
                 sum->hooked_count++;
                 nupLogBufferedf("  [HOOKED:%-5s] %-8s %s\n",
                                 hooksProviderName(prov), mod->name, name);
             }
         } else if (pass == 3) {
-            if (!is_sdk && !is_hooked && resolved) {
-                if (is_traced) {
-                    sum->traced_count++;
-                    if (audit_is_sys_api(name))
-                        nupLogBufferedf("  [TRACED] %-8s %s\n", mod->name, name);
-                } else {
-                    sum->native_count++;
-                }
+            if (hooksQueryProvider(name, NULL) != HOOK_PROV_NONE)
+                continue;
+            if (!audit_resolve_sym(set, mod, sym, name))
+                continue;
+            const bool is_fn = (type == R_AARCH64_JUMP_SLOT) ||
+                (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
+            if (is_fn && nupTraceShouldWrap(mod->name, name)) {
+                sum->traced_count++;
+                if (audit_is_sys_api(name))
+                    nupLogBufferedf("  [TRACED] %-8s %s\n", mod->name, name);
+            } else {
+                sum->native_count++;
             }
         }
     }

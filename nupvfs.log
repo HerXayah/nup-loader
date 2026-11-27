@@ -1,0 +1,6 @@
+=== nupvfs.nso started (heap=6MiB mods=1 trace=0 cache=1 native=0 cbutton=1) ===
+[cbutton] opening hid:sys...
+[cbutton] calling hid:sys cmd 171...
+[cbutton] hid:sys C-button listener active! evt=0xb01f2 activate=0x0
+[cbutton] C button triggered -> arming HBMenu ONLY (never a backup game)
+[cbutton] ClearNextPackage=0x0 ArmNextLaunch=0x0

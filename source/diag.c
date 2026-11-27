@@ -1292,22 +1292,19 @@ void nupDiagDumpLatestErpt(Handle hen_sm, FsFileSystem* sd) {
                 const bool f_ok = R_SUCCEEDED(fsFsOpenFile(sd, "/kaihen/last_erpt.bin",
                                                            FsOpenMode_Write | FsOpenMode_Append, &ef));
                 s64 pos = 0;
-                u32 first_chunk_len = 0;
                 bool code_logged = false;
-                for (u32 chunk = 0; chunk < 16; chunk++) {
+                for (u32 chunk = 0; chunk < 16 && (size_t)pos < sizeof(buf); chunk++) {
                     u32 got = 0;
+                    const size_t avail = sizeof(buf) - (size_t)pos;
                     if (R_FAILED(serviceDispatchOut(&rep, 1, got,
                             .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
-                            .buffers = {{buf, sizeof(buf)}})) || got == 0)
+                            .buffers = {{buf + pos, avail}})) || got == 0)
                         break;
-                    if (chunk == 0)
-                        first_chunk_len = got;
-                    if (f_ok) {
-                        fsFileWrite(&ef, pos, buf, got, FsWriteOption_Flush);
-                        pos += got;
-                    }
+                    if (f_ok)
+                        fsFileWrite(&ef, pos, buf + pos, got, FsWriteOption_Flush);
+                    pos += got;
                     if (!code_logged) {
-                        for (u32 at = 0; at + 24 < got; at++) {
+                        for (u32 at = 0; at + 24 < (u32)pos; at++) {
                             if (memcmp(buf + at, "ErrorCode", 9) == 0 && (buf[at + 9] & 0xE0) == 0xA0) {
                                 u32 len = buf[at + 9] & 31;
                                 char code[32] = {};
@@ -1334,8 +1331,8 @@ void nupDiagDumpLatestErpt(Handle hen_sm, FsFileSystem* sd) {
                 }
                 if (!code_logged)
                     nupLogf("[erpt] dumped %lld bytes [idx=%u] to /kaihen/last_erpt.bin\n", (long long)pos, chosen_k);
-                if (first_chunk_len > 0)
-                    log_erpt_summary(buf, first_chunk_len);
+                if (pos > 0)
+                    log_erpt_summary(buf, (size_t)pos);
                 serviceDispatch(&rep, 4);
             }
             serviceClose(&rep);
