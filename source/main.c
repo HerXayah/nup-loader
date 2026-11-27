@@ -21,7 +21,7 @@
 #include "ui.h"
 #include "vfs_romfs.h"
 
-#define NUP_BUILD_TAG "0325-cap47"
+#define NUP_BUILD_TAG "0325-cap52"
 
 static bool g_romfs_ui_printed = false;
 

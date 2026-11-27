@@ -1241,6 +1241,7 @@ static bool handle_sm_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool wi
         extract_reply_info(m, req.is_tipc, &ipc_rc, &out_h);
 
     // 2. Transparent HEN SM proxy fallback on 0x1015 (sm::ResultNotAllowed)
+    bool proxied = false;
     if (R_SUCCEEDED(krc) && ipc_rc == 0x1015u) {
         u8 fail_reply[0x100];
         memcpy(fail_reply, m, sizeof(fail_reply));
@@ -1261,6 +1262,7 @@ static bool handle_sm_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool wi
             else write_cmif_reply(m, false, 0, NULL, 0, 0, ph, INVALID_HANDLE);
             out_h = ph;
             ipc_rc = 0;
+            proxied = true;
         } else {
             // 3. Last-resort non-critical stand-in if BOTH real SM and HEN SM denied 0x1015
             if (!is_core_service(svc_name)) {
@@ -1291,6 +1293,14 @@ static bool handle_sm_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool wi
             session_register(out_h, SESS_AOC);
         else if (strncmp(svc_name, "bcat:", 5) == 0)
             session_register(out_h, SESS_BCAT);
+        // Trace-only visibility: successes are silent on the normal path.
+        // Proxied services already logged above; don't log twice.
+        if (!proxied && nupTraceIsEnabled()) {
+            u8 tls_save[0x100];
+            memcpy(tls_save, armGetTls(), sizeof(tls_save));
+            nupLogf("[svc-sm] GetService('%s') -> OK (h=0x%x)\n", svc_name, out_h);
+            memcpy(armGetTls(), tls_save, sizeof(tls_save));
+        }
     }
 
     regs[0] = krc;
@@ -1896,10 +1906,13 @@ void nupSvcHipcSetInStartup(bool in_startup) {
 // --- Central SVC Dispatcher (called from svc_entry.s on private 64 KiB stack) ---
 
 static volatile u32 g_svc_trace_cnt = 0;
+static volatile u64 g_svc_counts[0x40] = {0};
 
 int nupSvcDispatch(u64* regs, u32 svc_num) {
     if (nupTraceIsEnabled()) {
         const u32 n = __atomic_fetch_add(&g_svc_trace_cnt, 1, __ATOMIC_RELAXED);
+        if (svc_num < 0x40u)
+            __atomic_fetch_add(&g_svc_counts[svc_num], 1ULL, __ATOMIC_RELAXED);
         if (n < 32u) {
             u8 tls_save[0x100];
             memcpy(tls_save, armGetTls(), sizeof(tls_save));
@@ -1907,6 +1920,16 @@ int nupSvcDispatch(u64* regs, u32 svc_num) {
                     n, svc_num,
                     (unsigned long long)regs[0], (unsigned long long)regs[1],
                     (unsigned long long)regs[2], (unsigned long long)regs[3]);
+            memcpy(armGetTls(), tls_save, sizeof(tls_save));
+        } else if ((n & 0xFFFu) == 0u) {
+            // Periodic summary so nnMain-phase SVCs stay visible without per-call spam.
+            u8 tls_save[0x100];
+            memcpy(tls_save, armGetTls(), sizeof(tls_save));
+            nupLogf("[svc-trace #%u] summary 0x1F=%llu 0x21/0x22=%llu/%llu 0x29=%llu\n", n,
+                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x1Fu], __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x21u], __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x22u], __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x29u], __ATOMIC_RELAXED));
             memcpy(armGetTls(), tls_save, sizeof(tls_save));
         }
     }
@@ -1960,6 +1983,12 @@ int nupSvcDispatch(u64* regs, u32 svc_num) {
             }
         }
         s32 out_i = -1;
+        if (rcnt == 0) {
+            // All handles virtual (never signaled): report timeout, never call kernel with 0 handles.
+            regs[0] = 0xEA01u;
+            regs[1] = (u64)(s64)-1;
+            return 1;
+        }
         const Result rc = svcWaitSynchronization(&out_i, real_h, rcnt, (u64)regs[3]);
         regs[0] = rc;
         regs[1] = (R_SUCCEEDED(rc) && out_i >= 0 && out_i < rcnt) ? (u64)(s64)map_idx[out_i] : (u64)(s64)out_i;

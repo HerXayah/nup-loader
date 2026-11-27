@@ -361,10 +361,39 @@ void nupTracePollHeartbeat(u32 elapsed_ms, bool boot_phase) {
             g_slots[i].logged = h;
             char lr_s[64];
             fmt_trace_addr(g_slots[i].first_lr, lr_s, sizeof(lr_s));
-            nupLogBufferedf("[trace-api %ums] [%s] %s (hits=%u x0=0x%llx x1=0x%llx <- %s)\n",
-                            elapsed_ms, g_slots[i].mod_name, g_slots[i].name, h,
-                            (unsigned long long)g_slots[i].first_x0,
-                            (unsigned long long)g_slots[i].first_x1, lr_s);
+            // Best-effort thread-name decode: runs on loader thread, never on hot path.
+            char tname[32] = {};
+            if (strstr(g_slots[i].name, "SetThreadName") != NULL && g_slots[i].first_x1) {
+                MemoryInfo mi = {};
+                u32 pi = 0;
+                u64 a = g_slots[i].first_x1;
+                if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, a)) && (mi.perm & Perm_R) && a >= mi.addr) {
+                    char tmp[32];
+                    u64 avail = (mi.addr + mi.size) - a;
+                    u64 n = avail < sizeof(tmp) ? avail : sizeof(tmp);
+                    if (n > 0) {
+                        memcpy(tmp, (const void*)(uintptr_t)a, (size_t)n);
+                        if (n < sizeof(tmp)) tmp[n] = '\0';
+                        else tmp[sizeof(tmp) - 1] = '\0';
+                        size_t k = 0;
+                        while (k < sizeof(tmp) && tmp[k] >= 0x20 && tmp[k] < 0x7f) k++;
+                        if (k > 0 && (k >= sizeof(tmp) || tmp[k] == '\0')) {
+                            memcpy(tname, tmp, k);
+                            tname[k] = '\0';
+                        }
+                    }
+                }
+            }
+            if (tname[0])
+                nupLogBufferedf("[trace-api %ums] [%s] %s (hits=%u x0=0x%llx x1=0x%llx '%s' <- %s)\n",
+                                elapsed_ms, g_slots[i].mod_name, g_slots[i].name, h,
+                                (unsigned long long)g_slots[i].first_x0,
+                                (unsigned long long)g_slots[i].first_x1, tname, lr_s);
+            else
+                nupLogBufferedf("[trace-api %ums] [%s] %s (hits=%u x0=0x%llx x1=0x%llx <- %s)\n",
+                                elapsed_ms, g_slots[i].mod_name, g_slots[i].name, h,
+                                (unsigned long long)g_slots[i].first_x0,
+                                (unsigned long long)g_slots[i].first_x1, lr_s);
             logged_now++;
         }
     }

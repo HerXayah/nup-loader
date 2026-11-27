@@ -1140,7 +1140,7 @@ static bool erpt_key_interesting(const char* k) {
         "CrashThreadName", "ThreadName",
         "ProgramCounter", "LinkRegister", "StackPointer", "FramePointer",
         "FaultAddress", "FaultingAddress", "PC", "LR", "SP", "FP", "FAR", "ESR",
-        "Backtrace", "StackTrace", "StackTraceSize",
+        "Backtrace", "StackTrace", "StackTraceSize", "NxdmpIsAttached", "SyslogIsAttached",
         NULL
     };
     for (int i = 0; keys[i]; i++) {
@@ -1179,6 +1179,12 @@ static void log_erpt_summary(const u8* buf, size_t len) {
             i = vp;
             continue;
         }
+        if (p < len && (buf[p] == 0xc2 || buf[p] == 0xc3)) {
+            nupLogf("[erpt]   %s = %s\n", key, buf[p] == 0xc3 ? "true" : "false");
+            logged++;
+            i = p + 1;
+            continue;
+        }
         // Handle MsgPack array of u64/u32 (e.g. Backtrace / StackTrace)
         const u8 b = buf[p];
         u32 arr_len = 0;
@@ -1203,6 +1209,73 @@ static void log_erpt_summary(const u8* buf, size_t len) {
             }
         }
         i = p;
+    }
+}
+
+// Pull erpt attachments (nxdmp holds the registers/backtrace the context report lacks).
+static void nupDiagDumpAttachments(Service* r, Service* mgr, const u8* rep_id, FsFileSystem* sd) {
+    static u8 alist[0x200];
+    static u8 abuf[0x10000];
+    memset(alist, 0, sizeof(alist));
+    struct { u8 id[20]; } in;
+    memcpy(in.id, rep_id, 20);
+    u32 acount = 0;
+    Result rc = serviceDispatchInOut(mgr, 6, in, acount,
+        .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
+        .buffers = {{alist, sizeof(alist)}});
+    if (R_FAILED(rc) || acount == 0) {
+        nupLogf("[erpt] attachments: none (rc=0x%x)\n", rc);
+        return;
+    }
+    if (acount > 5) acount = 5;
+    for (u32 i = 0; i < acount; i++) {
+        const u8* e = alist + 8 + i * 0x58;
+        char aname[0x21] = {};
+        memcpy(aname, e + 0x38, 0x20);
+        u64 asize = 0;
+        memcpy(&asize, e + 0x30, 8);
+        nupLogf("[erpt] attachment[%u] '%s' size=%llu\n", i, aname, (unsigned long long)asize);
+        if (asize == 0) continue;
+        Service att = {};
+        rc = serviceDispatch(r, 2, .out_num_objects = 1, .out_objects = &att);
+        if (R_FAILED(rc)) break;
+        struct { u8 id[20]; } ain;
+        memcpy(ain.id, e + 0x14, 20);
+        rc = serviceDispatchIn(&att, 0, ain);
+        s64 total = 0;
+        if (R_SUCCEEDED(rc)) {
+            s64 rsize = 0;
+            rc = serviceDispatchOut(&att, 5, rsize);
+            if (R_SUCCEEDED(rc) && rsize > 0) {
+                char path[64];
+                snprintf(path, sizeof(path), "/kaihen/last_attach_%u.bin", i);
+                fsFsDeleteFile(sd, path);
+                fsFsCreateFile(sd, path, 0, 0);
+                FsFile ef = {};
+                const bool f_ok = R_SUCCEEDED(fsFsOpenFile(sd, path,
+                    FsOpenMode_Write | FsOpenMode_Append, &ef));
+                if (asize > 0x100000) asize = 0x100000;
+                while (total < (s64)asize) {
+                    u32 got = 0;
+                    u64 want = asize - (u64)total;
+                    if (want > sizeof(abuf)) want = sizeof(abuf);
+                    if (R_FAILED(serviceDispatchOut(&att, 1, got,
+                            .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
+                            .buffers = {{abuf, (size_t)want}})) || got == 0)
+                        break;
+                    if (f_ok) fsFileWrite(&ef, total, abuf, got, FsWriteOption_Flush);
+                    total += got;
+                }
+                if (f_ok) {
+                    fsFileFlush(&ef);
+                    fsFileClose(&ef);
+                    fsFsCommit(sd);
+                }
+                nupLogf("[erpt] dumped %lld bytes to %s\n", (long long)total, path);
+            }
+            serviceDispatch(&att, 4);
+        }
+        serviceClose(&att);
     }
 }
 
@@ -1280,10 +1353,12 @@ void nupDiagDumpLatestErpt(Handle hen_sm, FsFileSystem* sd) {
         }
     }
     if (count > 0 && sd) {
+        u8 rep_id[20] = {};
+        memcpy(rep_id, list + 8 + chosen_k * 0x70 + 4, 20);
         Service rep = {};
         if (R_SUCCEEDED(serviceDispatch(&r, 0, .out_num_objects = 1, .out_objects = &rep))) {
             struct { u8 id[20]; } in;
-            memcpy(in.id, list + 8 + chosen_k * 0x70 + 4, 20);
+            memcpy(in.id, rep_id, 20);
             if (R_SUCCEEDED(serviceDispatchIn(&rep, 0, in))) {
                 static u8 buf[0x10000];
                 fsFsDeleteFile(sd, "/kaihen/last_erpt.bin");
@@ -1337,6 +1412,7 @@ void nupDiagDumpLatestErpt(Handle hen_sm, FsFileSystem* sd) {
             }
             serviceClose(&rep);
         }
+        nupDiagDumpAttachments(&r, &mgr, rep_id, sd);
     }
     serviceClose(&mgr);
     serviceClose(&r);
