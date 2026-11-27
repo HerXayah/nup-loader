@@ -6,6 +6,7 @@
 #include "trace.h"
 #include "vfs_romfs.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1209,6 +1210,77 @@ static bool is_core_service(const char* name) {
     return false;
 }
 
+static const char* session_kind_name(TrackedSessionKind k) {
+    switch (k) {
+    case SESS_SM:      return "sm";
+    case SESS_FSP_SRV: return "fsp-srv";
+    case SESS_LDR_RO:  return "ldr:ro";
+    case SESS_AOC:     return "aoc:u";
+    case SESS_BCAT:    return "bcat";
+    default:           return "?";
+    }
+}
+
+// Log without clobbering an IPC reply/request currently sitting in TLS (or user buffer).
+static void log_preserving(u8* m, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+static void log_preserving(u8* m, const char* fmt, ...) {
+    u8 save[0x100];
+    memcpy(save, m, sizeof(save));
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    nupLogf("%s", line);
+    memcpy(m, save, sizeof(save));
+}
+
+// Control requests on a tracked session. The SDK's HIPC client pool clones sessions
+// (CloneCurrentObject / CloneCurrentObjectEx) and sends the real traffic (MountRom,
+// OpenDataStorage*, saves, ...) on the clones. Every clone must inherit tracking,
+// otherwise those requests bypass the VFS and go straight to the donor's real FS.
+static bool forward_control_track(u64* regs, Handle h, u8* m, const ParsedIpc* req,
+                                  bool with_user_buf, u64 ubuf_sz) {
+    if (req->cmd != 0u && req->cmd != 2u && req->cmd != 4u)
+        return false; // CopyFromCurrentDomain / QueryPointerBufferSize: pass through
+    nupSpinLock(&g_svc_lock);
+    TrackedSession* ps = session_find_locked(h);
+    const TrackedSessionKind kind = ps ? ps->kind : SESS_NONE;
+    const bool parent_dom = ps ? ps->is_domain : false;
+    nupSpinUnlock(&g_svc_lock);
+    if (kind == SESS_NONE)
+        return false;
+
+    const Result krc = with_user_buf ? svcSendSyncRequestWithUserBuffer(m, ubuf_sz, h)
+                                     : svcSendSyncRequest(h);
+    regs[0] = krc;
+    if (R_FAILED(krc))
+        return true;
+
+    if (req->cmd == 0u) {
+        nupSpinLock(&g_svc_lock);
+        TrackedSession* s2 = session_find_locked(h);
+        if (s2) s2->is_domain = true;
+        nupSpinUnlock(&g_svc_lock);
+        log_preserving(m, "[svc-ipc] %s h=0x%x -> domain\n", session_kind_name(kind), h);
+        return true;
+    }
+
+    u32 res = 0;
+    Handle nh = INVALID_HANDLE;
+    extract_reply_info(m, false, &res, &nh);
+    if (R_SUCCEEDED(res) && nh != INVALID_HANDLE) {
+        session_register(nh, kind);
+        nupSpinLock(&g_svc_lock);
+        TrackedSession* ns = session_find_locked(nh);
+        if (ns) ns->is_domain = parent_dom;
+        nupSpinUnlock(&g_svc_lock);
+        log_preserving(m, "[svc-ipc] %s clone h=0x%x -> 0x%x (dom=%d) tracked\n",
+                       session_kind_name(kind), h, nh, parent_dom ? 1 : 0);
+    }
+    return true;
+}
+
 static bool handle_sm_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool with_user_buf, u64 ubuf_sz) {
     ParsedIpc req;
     if (!parse_ipc_request(req_buf, false, &req))
@@ -1312,21 +1384,8 @@ static bool handle_bcat_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool 
     ParsedIpc req;
     if (!parse_ipc_request(req_buf, is_domain, &req))
         return false;
-    if (req.type == 5u || req.type == 7u) {
-        if (req.cmd == 0u) {
-            const Result krc = with_user_buf ? svcSendSyncRequestWithUserBuffer(m, ubuf_sz, h)
-                                             : svcSendSyncRequest(h);
-            if (R_SUCCEEDED(krc)) {
-                nupSpinLock(&g_svc_lock);
-                TrackedSession* s2 = session_find_locked(h);
-                if (s2) s2->is_domain = true;
-                nupSpinUnlock(&g_svc_lock);
-            }
-            regs[0] = krc;
-            return true;
-        }
-        return false;
-    }
+    if (req.type == 5u || req.type == 7u)
+        return forward_control_track(regs, h, m, &req, with_user_buf, ubuf_sz);
     const Result krc = with_user_buf ? svcSendSyncRequestWithUserBuffer(m, ubuf_sz, h)
                                      : svcSendSyncRequest(h);
     if (R_SUCCEEDED(krc)) {
@@ -1402,21 +1461,8 @@ static bool handle_aoc_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool i
     ParsedIpc req;
     if (!parse_ipc_request(req_buf, is_domain, &req))
         return false;
-    if (req.type == 5u || req.type == 7u) {
-        if (req.cmd == 0u) {
-            const Result krc = with_user_buf ? svcSendSyncRequestWithUserBuffer(m, ubuf_sz, h)
-                                             : svcSendSyncRequest(h);
-            if (R_SUCCEEDED(krc)) {
-                nupSpinLock(&g_svc_lock);
-                TrackedSession* s2 = session_find_locked(h);
-                if (s2) s2->is_domain = true;
-                nupSpinUnlock(&g_svc_lock);
-            }
-            regs[0] = krc;
-            return true;
-        }
-        return false;
-    }
+    if (req.type == 5u || req.type == 7u)
+        return forward_control_track(regs, h, m, &req, with_user_buf, ubuf_sz);
     if (req.is_domain && req.domain_cmd == 2u)
         return false;
 
@@ -1503,21 +1549,8 @@ static bool handle_fsp_srv_ipc(u64* regs, Handle h, TrackedSession* sess, u8* m,
         return false;
 
     // Control cmd 0: ConvertCurrentObjectToDomain
-    if (req.type == 5u || req.type == 7u) {
-        if (req.cmd == 0u) {
-            const Result krc = with_user_buf ? svcSendSyncRequestWithUserBuffer(m, ubuf_sz, h)
-                                             : svcSendSyncRequest(h);
-            if (R_SUCCEEDED(krc)) {
-                nupSpinLock(&g_svc_lock);
-                TrackedSession* s2 = session_find_locked(h);
-                if (s2) s2->is_domain = true;
-                nupSpinUnlock(&g_svc_lock);
-            }
-            regs[0] = krc;
-            return true;
-        }
-        return false;
-    }
+    if (req.type == 5u || req.type == 7u)
+        return forward_control_track(regs, h, m, &req, with_user_buf, ubuf_sz);
 
     // Domain dispatch to virtual object
     if (req.is_domain && is_vobj(req.domain_obj)) {
@@ -1719,7 +1752,27 @@ static bool handle_fsp_srv_ipc(u64* regs, Handle h, TrackedSession* sess, u8* m,
         return true;
     }
 
-    return false;
+    // Trace-mode visibility for the silent-passthrough path (Rom mount/query etc.).
+    // Handled cmds already log above; this catches everything we decline.
+    if (nupTraceIsEnabled()) {
+        u64 w0 = 0;
+        if (req.raw_in && req.raw_in_bytes >= 8) memcpy(&w0, req.raw_in, 8);
+        nupLogf("[svc-fs] cmd=%u dom=%u dcmd=%u tipc=%u inlen=%u w0=0x%llx -> passthrough\n",
+                req.cmd, req.is_domain ? 1u : 0u, req.domain_cmd,
+                req.is_tipc ? 1u : 0u, req.raw_in_bytes, (unsigned long long)w0);
+    }
+
+    // Unhandled fsp-srv command: log once per cmd id, then pass through to real FS.
+    {
+        static u8 seen[512];
+        const u32 c = req.cmd;
+        if (c < sizeof(seen) * 8u && !(seen[c >> 3] & (1u << (c & 7u)))) {
+            seen[c >> 3] |= (u8)(1u << (c & 7u));
+            nupLogf("[svc-fs] fsp-srv cmd %u%s -> passthrough (h=0x%x)\n",
+                    c, dom ? " (domain)" : "", h);
+        }
+    }
+    return false; // caller restores m from req_buf
 }
 
 // --- Public lifecycle API ---
@@ -2043,6 +2096,18 @@ int nupSvcDispatch(u64* regs, u32 svc_num) {
         TrackedSession snap = s ? *s : (TrackedSession){0};
         nupSpinUnlock(&g_svc_lock);
 
+        // Trace-mode visibility: log every IPC on tracked sessions pre-parse.
+        // This catches parse-failures and domain traffic that handlers decline silently.
+        if (snap.kind != SESS_NONE && nupTraceIsEnabled()) {
+            u8 tls_save[0x100];
+            memcpy(tls_save, armGetTls(), sizeof(tls_save));
+            u32 w[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            memcpy(w, req_buf + 0, 32);
+            nupLogf("[svc-ipc] sess=%u h=0x%x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    (unsigned)snap.kind, h, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            memcpy(armGetTls(), tls_save, sizeof(tls_save));
+        }
+
         if (snap.kind == SESS_NONE)
             return 0;
 
@@ -2113,6 +2178,11 @@ int nupSvcDispatch(u64* regs, u32 svc_num) {
             regs[1] = val;
             return 1;
         }
+        // Trace-mode visibility: which other kernel truths does the game read?
+        // (Rom-image discovery via GetInfo/alias-region would surface here.)
+        if (nupTraceIsEnabled())
+            nupLogf("[svc-info] type=0x%x sub=0x%llx -> passthrough\n",
+                    type, (unsigned long long)sub);
         return 0;
     }
 
