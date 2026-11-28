@@ -25,8 +25,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build ounce-devkit image
-        run: docker build -t ounce-devkit https://github.com/ouncebrew/ounce-devkit.git
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ounce-devkit image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: https://github.com/ouncebrew/ounce-devkit.git
+          tags: ounce-devkit:latest
+          load: true
+          cache-from: type=gha,scope=ounce-devkit
+          cache-to: type=gha,mode=max,scope=ounce-devkit
 
       - name: Build nup-loader.nro and nupvfs.nso
         run: |
