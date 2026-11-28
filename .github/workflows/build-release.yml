@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: MIT
+# Builds nup-loader.nro and resident plugin nupvfs.nso using ounce-devkit.
+# Pushing a tag (v* or YYYYMMDD*) publishes a GitHub Release automatically.
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+      - '[0-9]*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build nup-loader & nupvfs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build ounce-devkit image
+        run: docker build -t ounce-devkit https://github.com/ouncebrew/ounce-devkit.git
+
+      - name: Build nup-loader.nro and nupvfs.nso
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ounce-devkit bash -euo pipefail -c '
+            make -j"$(nproc)"
+            make -C plugin -j"$(nproc)"
+          '
+
+      - name: Package release bundle
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          mkdir -p dist/stage/kaihen/programs dist/stage/kaihen/plugins dist/stage/switch/nup-loader
+          cp nup-loader.nro dist/stage/kaihen/programs/nup-loader.nro
+          cp nup-loader.nro dist/stage/switch/nup-loader/nup-loader.nro
+          cp plugin/nupvfs.nso dist/stage/kaihen/plugins/nupvfs.nso
+          cp nup-loader.nro dist/nup-loader.nro
+          cp plugin/nupvfs.nso dist/nupvfs.nso
+          (cd dist/stage && zip -q -r -X "../nup-loader-${version}.zip" .)
+          rm -rf dist/stage
+          (cd dist && sha256sum "nup-loader-${version}.zip" nup-loader.nro nupvfs.nso > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nup-loader-${{ env.VERSION }}
+          path: dist/
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "nup-loader ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "dist/nup-loader-${VERSION}.zip" \
+            dist/nup-loader.nro \
+            dist/nupvfs.nso \
+            dist/SHA256SUMS.txt
