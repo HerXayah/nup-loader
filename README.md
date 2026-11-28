@@ -38,9 +38,9 @@ downloads before copying anything to the SD card.
    Reboot after this: `nupvfs.nso` is a boot-time plugin, so it is only started
    on the next boot. Its toggles are under **Settings → Plugins → nupvfs** in
    our hbmenu.
-4. Supply a donor game. nup-loader requires the donor's signed `main.npdm` at
-   `/kaihen/bin/game/main.npdm`; it writes `/kaihen/bin/game/next.nsp` next to
-   it when launching. See [HANDOVER.md](docs/HANDOVER.md) for donor status.
+4. Launch A game via HBMenu. Make sure you got a SW1 game inserted or Downloaded at least for it to start a SW1 game.
+5. If it crashes, open NUP-Loader and do a tracing run with Y.
+6. Upload that as a Issue on Nup-Loaders Github.
 
 Boot a native game while holding R, then launch nup-loader from hbmenu.
 
