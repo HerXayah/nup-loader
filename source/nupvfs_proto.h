@@ -9,7 +9,7 @@
 #define NUPVFS_MAGIC       0x56465331u /* "VFS1" */
 #define NUPVFS_VERSION     1u
 #define NUPVFS_MAX_SLOTS   16u
-#define NUPVFS_MAX_LAYERS  6u
+#define NUPVFS_MAX_LAYERS  16u
 #define NUPVFS_PATH_MAX    0x300u
 
 // Feature / settings bitflags shared with ounce-hbmenu Settings -> Plugins

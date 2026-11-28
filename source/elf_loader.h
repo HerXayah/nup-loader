@@ -75,6 +75,7 @@ typedef u64 (*SymbolHookFn)(const char* name, u64 real_addr);
 
 Result elfLoadNupModules(ModuleSet* set, NupArchive* nup,
                          const NupFileInfo* exefs, u32 exefs_count);
+void elfSetModContext(FsFileSystem* sd, u64 title_id, bool mods_enabled);
 Result elfLoadNupModulesForAudit(ModuleSet* set, NupArchive* nup,
                                  const NupFileInfo* exefs, u32 exefs_count);
 void elfUnloadAuditModules(ModuleSet* set);

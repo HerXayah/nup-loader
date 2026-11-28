@@ -210,7 +210,7 @@ static Result on_setting_apply(void* ctx, const KaihenPluginSetting* setting) {
 }
 
 static const KaihenPluginSettingsTable g_settings_table = {
-    .name = "nupvfs (Game VFS & C-Button)",
+    .name = "nupvfs",
     .settings = g_settings,
     .count = (u32)(sizeof(g_settings) / sizeof(g_settings[0])),
     .apply = on_setting_apply,

@@ -400,17 +400,288 @@ u32 elfPatchNroSvcs(u8* nro_buf, u64 nro_size, const char* tag) {
     return idx;
 }
 
+static FsFileSystem* g_mod_sd = NULL;
+static u64 g_mod_tid = 0;
+static bool g_mod_enabled = false;
+
+void elfSetModContext(FsFileSystem* sd, u64 title_id, bool mods_enabled) {
+    g_mod_sd = sd;
+    g_mod_tid = title_id;
+    g_mod_enabled = mods_enabled;
+}
+
+static bool mod_file_exists(FsFileSystem* sd, const char* path) {
+    u32 et = 0;
+    return sd && path && path[0] &&
+           R_SUCCEEDED(nupRawFsGetEntryType(sd, path, &et)) &&
+           et == FsDirEntryType_File;
+}
+
+static bool mod_dir_exists(FsFileSystem* sd, const char* path) {
+    u32 et = 0;
+    return sd && path && path[0] &&
+           R_SUCCEEDED(nupRawFsGetEntryType(sd, path, &et)) &&
+           et == FsDirEntryType_Dir;
+}
+
+static int cmp_pack_name(const void* a, const void* b) {
+    return strcmp((const char*)a, (const char*)b);
+}
+
+static u32 collect_enabled_pack_roots(FsFileSystem* sd, u64 tid,
+                                      char out_roots[][0x200], u32 max_roots) {
+    if (!sd || !tid || !max_roots) return 0;
+    char packs_dir[0x100];
+    snprintf(packs_dir, sizeof(packs_dir), "/kaihen/mods/%016llx/packs", (unsigned long long)tid);
+    FsDir dir = {};
+    if (R_FAILED(nupRawFsOpenDir(sd, packs_dir, FsDirOpenMode_ReadDirs, &dir)))
+        return 0;
+    char names[16][64];
+    u32 ncnt = 0;
+    FsDirectoryEntry ents[16];
+    s64 got = 0;
+    while (ncnt < 16 && R_SUCCEEDED(nupRawDirRead(&dir, &got, ents, 16)) && got > 0) {
+        for (s64 i = 0; i < got && ncnt < 16; i++) {
+            const char* nm = ents[i].name;
+            if (!nm[0] || nm[0] == '.' || nm[0] == '_')
+                continue;
+            char dis[0x240];
+            snprintf(dis, sizeof(dis), "%s/%s/.disabled", packs_dir, nm);
+            if (mod_file_exists(sd, dis))
+                continue;
+            snprintf(names[ncnt++], sizeof(names[0]), "%.63s", nm);
+        }
+    }
+    serviceClose(&dir.s);
+    if (ncnt > 1)
+        qsort(names, ncnt, sizeof(names[0]), cmp_pack_name);
+    u32 out = 0;
+    for (u32 i = 0; i < ncnt && out < max_roots; i++) {
+        snprintf(out_roots[out++], 0x200, "%s/%s", packs_dir, names[i]);
+    }
+    return out;
+}
+
+static bool find_exefs_override(const char* mod_name, char* out_path, size_t out_sz) {
+    if (!g_mod_enabled || !g_mod_sd || !g_mod_tid || !mod_name || !mod_name[0])
+        return false;
+    // Highest priority: flat /kaihen/mods/<tid>/exefs/<name>
+    snprintf(out_path, out_sz, "/kaihen/mods/%016llx/exefs/%s", (unsigned long long)g_mod_tid, mod_name);
+    if (mod_file_exists(g_mod_sd, out_path))
+        return true;
+    // Named packs (last alphabetically wins)
+    char packs[12][0x200];
+    const u32 pcnt = collect_enabled_pack_roots(g_mod_sd, g_mod_tid, packs, 12);
+    for (s32 i = (s32)pcnt - 1; i >= 0; i--) {
+        snprintf(out_path, out_sz, "%s/exefs/%s", packs[i], mod_name);
+        if (mod_file_exists(g_mod_sd, out_path))
+            return true;
+    }
+    return false;
+}
+
+static bool apply_ips_file(FsFileSystem* sd, const char* ips_path,
+                           u8* nso_mem, u64 nso_mem_sz, const char* mod_name) {
+    FsFile f = {};
+    if (R_FAILED(nupRawFsOpenFile(sd, ips_path, FsOpenMode_Read, &f)))
+        return false;
+    s64 fsz = 0;
+    if (R_FAILED(nupRawFileGetSize(&f, &fsz)) || fsz < 8 || fsz > (8 << 20)) {
+        serviceClose(&f.s);
+        return false;
+    }
+    u8* data = (u8*)malloc((size_t)fsz);
+    if (!data) {
+        serviceClose(&f.s);
+        return false;
+    }
+    u64 got = 0;
+    Result rc = nupRawFileRead(&f, 0, data, (u64)fsz, &got);
+    serviceClose(&f.s);
+    if (R_FAILED(rc) || got != (u64)fsz) {
+        free(data);
+        return false;
+    }
+
+    const bool is_ips32 = (memcmp(data, "IPS32", 5) == 0);
+    const bool is_ips   = (!is_ips32 && memcmp(data, "PATCH", 5) == 0);
+    if (!is_ips && !is_ips32) {
+        free(data);
+        return false;
+    }
+
+    size_t pos = 5;
+    u32 hunks = 0;
+    u64 patched_bytes = 0;
+    while (pos < (size_t)fsz) {
+        if (is_ips32) {
+            if (pos + 4 <= (size_t)fsz && memcmp(data + pos, "EEOF", 4) == 0)
+                break;
+            if (pos + 6 > (size_t)fsz) break;
+        } else {
+            if (pos + 3 <= (size_t)fsz && memcmp(data + pos, "EOF", 3) == 0)
+                break;
+            if (pos + 5 > (size_t)fsz) break;
+        }
+        u32 off = 0;
+        if (is_ips32) {
+            off = ((u32)data[pos] << 24) | ((u32)data[pos + 1] << 16) |
+                  ((u32)data[pos + 2] << 8) | (u32)data[pos + 3];
+            pos += 4;
+        } else {
+            off = ((u32)data[pos] << 16) | ((u32)data[pos + 1] << 8) | (u32)data[pos + 2];
+            pos += 3;
+        }
+        u32 sz = ((u32)data[pos] << 8) | (u32)data[pos + 1];
+        pos += 2;
+
+        // Switch IPS offsets include the 0x100 NSO header
+        if (sz == 0) {
+            if (pos + 3 > (size_t)fsz) break;
+            const u32 rle_len = ((u32)data[pos] << 8) | (u32)data[pos + 1];
+            const u8 rle_val = data[pos + 2];
+            pos += 3;
+            if (off >= 0x100u && (u64)(off - 0x100u) + rle_len <= nso_mem_sz) {
+                memset(nso_mem + (off - 0x100u), rle_val, rle_len);
+                hunks++;
+                patched_bytes += rle_len;
+            }
+        } else {
+            if (pos + sz > (size_t)fsz) break;
+            if (off >= 0x100u && (u64)(off - 0x100u) + sz <= nso_mem_sz) {
+                memcpy(nso_mem + (off - 0x100u), data + pos, sz);
+                hunks++;
+                patched_bytes += sz;
+            }
+            pos += sz;
+        }
+    }
+    free(data);
+    if (hunks > 0) {
+        nupLogf("[ips] applied %s (%u hunk(s), %llu byte(s)) -> %s\n",
+                ips_path, hunks, (unsigned long long)patched_bytes, mod_name);
+        return true;
+    }
+    return false;
+}
+
+static void scan_ips_dir_for_build_id(FsFileSystem* sd, const char* dir_path,
+                                      const char* bid_trim_up, const char* bid_trim_lo,
+                                      const char* bid_full_up, const char* bid_full_lo,
+                                      u8* nso_mem, u64 nso_mem_sz, const char* mod_name) {
+    if (!mod_dir_exists(sd, dir_path))
+        return;
+    const char* const cands[4] = { bid_trim_up, bid_trim_lo, bid_full_up, bid_full_lo };
+    char p[0x300];
+    for (int i = 0; i < 4; i++) {
+        if (!cands[i] || !cands[i][0]) continue;
+        if (i > 0 && strcmp(cands[i], cands[i - 1]) == 0) continue;
+        snprintf(p, sizeof(p), "%s/%s.ips", dir_path, cands[i]);
+        if (mod_file_exists(sd, p)) {
+            apply_ips_file(sd, p, nso_mem, nso_mem_sz, mod_name);
+            return;
+        }
+    }
+}
+
+static void apply_ips_patches_for_nso(const u8 build_id[32], u8* nso_mem, u64 nso_mem_sz, const char* mod_name) {
+    if (!g_mod_enabled || !g_mod_sd || !g_mod_tid)
+        return;
+    // Format full 64-hex and trimmed (Atmosphere standard) Build ID
+    int trim_len = 32;
+    while (trim_len > 1 && build_id[trim_len - 1] == 0)
+        trim_len--;
+    char full_up[65], full_lo[65], trim_up[65], trim_lo[65];
+    static const char hx_up[] = "0123456789ABCDEF";
+    static const char hx_lo[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        full_up[i * 2] = hx_up[build_id[i] >> 4];
+        full_up[i * 2 + 1] = hx_up[build_id[i] & 0xf];
+        full_lo[i * 2] = hx_lo[build_id[i] >> 4];
+        full_lo[i * 2 + 1] = hx_lo[build_id[i] & 0xf];
+    }
+    full_up[64] = full_lo[64] = '\0';
+    memcpy(trim_up, full_up, (size_t)trim_len * 2); trim_up[trim_len * 2] = '\0';
+    memcpy(trim_lo, full_lo, (size_t)trim_len * 2); trim_lo[trim_len * 2] = '\0';
+
+    // 1. Global patch roots: /kaihen/exefs_patches/<mod>/ and /atmosphere/exefs_patches/<mod>/
+    static const char* const global_roots[] = {
+        "/kaihen/exefs_patches",
+        "/atmosphere/exefs_patches",
+    };
+    for (size_t r = 0; r < 2; r++) {
+        FsDir d = {};
+        if (R_FAILED(nupRawFsOpenDir(g_mod_sd, global_roots[r], FsDirOpenMode_ReadDirs, &d)))
+            continue;
+        FsDirectoryEntry ents[16];
+        s64 got = 0;
+        while (R_SUCCEEDED(nupRawDirRead(&d, &got, ents, 16)) && got > 0) {
+            for (s64 i = 0; i < got; i++) {
+                const char* nm = ents[i].name;
+                if (!nm[0] || nm[0] == '.' || nm[0] == '_') continue;
+                char sub[0x240];
+                snprintf(sub, sizeof(sub), "%s/%s", global_roots[r], nm);
+                scan_ips_dir_for_build_id(g_mod_sd, sub, trim_up, trim_lo, full_up, full_lo,
+                                          nso_mem, nso_mem_sz, mod_name);
+            }
+        }
+        serviceClose(&d.s);
+    }
+
+    // 2. Named packs: /kaihen/mods/<tid>/packs/<pack>/exefs_patches/
+    char packs[12][0x200];
+    const u32 pcnt = collect_enabled_pack_roots(g_mod_sd, g_mod_tid, packs, 12);
+    for (u32 i = 0; i < pcnt; i++) {
+        char sub[0x240];
+        snprintf(sub, sizeof(sub), "%s/exefs_patches", packs[i]);
+        scan_ips_dir_for_build_id(g_mod_sd, sub, trim_up, trim_lo, full_up, full_lo,
+                                  nso_mem, nso_mem_sz, mod_name);
+    }
+
+    // 3. Flat title patches: /kaihen/mods/<tid>/exefs_patches/
+    char flat[0x180];
+    snprintf(flat, sizeof(flat), "/kaihen/mods/%016llx/exefs_patches", (unsigned long long)g_mod_tid);
+    scan_ips_dir_for_build_id(g_mod_sd, flat, trim_up, trim_lo, full_up, full_lo,
+                              nso_mem, nso_mem_sz, mod_name);
+}
+
+static Result read_nso_source(NupArchive* nup, const NupFileInfo* fi,
+                              FsFile* ov_file, bool has_ov,
+                              u64 off, void* dst, u64 sz) {
+    if (has_ov) {
+        u64 got = 0;
+        Result rc = nupRawFileRead(ov_file, off, dst, sz, &got);
+        if (R_FAILED(rc)) return rc;
+        return (got == sz) ? 0 : MAKERESULT(Module_Libnx, LibnxError_IoError);
+    }
+    return nupReadExefs(nup, fi, off, dst, sz);
+}
+
 static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
                               LoadedModule* out, bool map_executable) {
     memset(out, 0, sizeof(*out));
     snprintf(out->name, sizeof(out->name), "%.31s", fi->name);
 
+    FsFile ov_file = {};
+    bool has_ov = false;
+    char ov_path[0x260] = {};
+    if (find_exefs_override(fi->name, ov_path, sizeof(ov_path))) {
+        if (R_SUCCEEDED(nupRawFsOpenFile(g_mod_sd, ov_path, FsOpenMode_Read, &ov_file))) {
+            has_ov = true;
+            nupLogf("[exefs-mod] overriding '%s' with %s\n", fi->name, ov_path);
+        }
+    }
+
     u8 hdr[0x100];
-    Result rc = nupReadExefs(nup, fi, 0, hdr, sizeof(hdr));
-    if (R_FAILED(rc))
+    Result rc = read_nso_source(nup, fi, &ov_file, has_ov, 0, hdr, sizeof(hdr));
+    if (R_FAILED(rc)) {
+        if (has_ov) serviceClose(&ov_file.s);
         return rc;
-    if (memcmp(hdr, "NSO0", 4) != 0)
+    }
+    if (memcmp(hdr, "NSO0", 4) != 0) {
+        if (has_ov) serviceClose(&ov_file.s);
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
 
     u32 flags = 0;
     u32 tf, tm, ts, rf, rm, rs, df, dm, ds, bss;
@@ -422,8 +693,10 @@ static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
     memcpy(&bss, hdr + 0x3c, 4);
     memcpy(&tc, hdr + 0x60, 4); memcpy(&rc_sz, hdr + 0x64, 4); memcpy(&dc, hdr + 0x68, 4);
 
-    if (tm != 0 || rm == 0 || dm <= rm || (rm & 0xfff) || (dm & 0xfff))
+    if (tm != 0 || rm == 0 || dm <= rm || (rm & 0xfff) || (dm & 0xfff)) {
+        if (has_ov) serviceClose(&ov_file.s);
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
 
     const u64 text_seg_sz = rm;
     const u64 ro_seg_sz = dm - rm;
@@ -432,8 +705,10 @@ static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
     const u64 nro_img_sz = 0x1000 + text_seg_sz + ro_seg_sz + data_seg_sz;
 
     u8* buf = (u8*)memalign(0x1000, (size_t)nro_img_sz);
-    if (!buf)
+    if (!buf) {
+        if (has_ov) serviceClose(&ov_file.s);
         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
     memset(buf, 0, (size_t)nro_img_sz);
 
     memcpy(buf + 0x10, "NRO0", 4);
@@ -474,7 +749,7 @@ static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
                 free(buf);
                 return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             }
-            rc = nupReadExefs(nup, fi, foffs[s], tmp, csizes[s]);
+            rc = read_nso_source(nup, fi, &ov_file, has_ov, foffs[s], tmp, csizes[s]);
             if (R_SUCCEEDED(rc)) {
                 const bool dec_ok = is_zbic
                     ? zbicDecompress(dst, dsizes[s], tmp, csizes[s])
@@ -488,17 +763,24 @@ static Result load_one_nso_ex(NupArchive* nup, const NupFileInfo* fi, u32 index,
             }
             free(tmp);
             if (R_FAILED(rc)) {
+                if (has_ov) serviceClose(&ov_file.s);
                 free(buf);
                 return rc;
             }
         } else {
-            rc = nupReadExefs(nup, fi, foffs[s], dst, dsizes[s]);
+            rc = read_nso_source(nup, fi, &ov_file, has_ov, foffs[s], dst, dsizes[s]);
             if (R_FAILED(rc)) {
+                if (has_ov) serviceClose(&ov_file.s);
                 free(buf);
                 return rc;
             }
         }
     }
+    if (has_ov)
+        serviceClose(&ov_file.s);
+
+    // Apply IPS / IPS32 patches matched by NSO Build ID (hdr + 0x40) BEFORE SVC patching
+    apply_ips_patches_for_nso(hdr + 0x40, buf + 0x1000, nro_img_sz - 0x1000, fi->name);
 
     // Forward the module's header pointers into page 0 of the NRO wrapper so
     // Switch 2 SDK code-segment scans (starting at nro_base) find MOD0 + header2.

@@ -433,22 +433,71 @@ static bool mount_romfs_via_plugin(VfsRomfs* dst, const char* rom_root,
     return true;
 }
 
+static int cmp_mod_pack(const void* a, const void* b) {
+    return strcmp((const char*)a, (const char*)b);
+}
+
 static void build_romfs_with_mods(VfsRomfs* dst, const char* rom_root,
                                   const char* upd_overlay, int prog_idx) {
+    char pack_bufs[12][0x300];
     char mod1[0x300] = {}, mod2[0x300] = {};
-    const char* overlays[4];
+    const char* overlays[NUPVFS_MAX_LAYERS];
     int ov_cnt = 0;
-    if (upd_overlay && upd_overlay[0])
+    if (upd_overlay && upd_overlay[0] && ov_cnt < (int)NUPVFS_MAX_LAYERS - 1)
         overlays[ov_cnt++] = upd_overlay;
     if (g_title_id && (g_vfs_flags & NUPVFS_FLAG_MODS)) {
-        if (prog_idx > 0) {
+        // 1. Named mod packs in /kaihen/mods/<tid>/packs/<name>/ (alphabetical, skip '_' or '.disabled')
+        char packs_dir[0x100];
+        snprintf(packs_dir, sizeof(packs_dir), "/kaihen/mods/%016llx/packs",
+                 (unsigned long long)g_title_id);
+        FsDir pdir = {};
+        if (R_SUCCEEDED(nupRawFsOpenDir(g_sd, packs_dir, FsDirOpenMode_ReadDirs, &pdir))) {
+            char pnames[12][64];
+            int pcnt = 0;
+            FsDirectoryEntry pents[12];
+            s64 pgot = 0;
+            while (pcnt < 12 && R_SUCCEEDED(nupRawDirRead(&pdir, &pgot, pents, 12)) && pgot > 0) {
+                for (s64 i = 0; i < pgot && pcnt < 12; i++) {
+                    const char* nm = pents[i].name;
+                    if (!nm[0] || nm[0] == '.' || nm[0] == '_')
+                        continue;
+                    char dis[0x240];
+                    snprintf(dis, sizeof(dis), "%s/%s/.disabled", packs_dir, nm);
+                    u32 det = 0;
+                    if (R_SUCCEEDED(nupRawFsGetEntryType(g_sd, dis, &det)) && det == FsDirEntryType_File)
+                        continue;
+                    snprintf(pnames[pcnt++], sizeof(pnames[0]), "%.63s", nm);
+                }
+            }
+            serviceClose(&pdir.s);
+            if (pcnt > 1)
+                qsort(pnames, (size_t)pcnt, sizeof(pnames[0]), cmp_mod_pack);
+            for (int i = 0; i < pcnt && ov_cnt < (int)NUPVFS_MAX_LAYERS - 3; i++) {
+                if (prog_idx > 0) {
+                    snprintf(pack_bufs[i], sizeof(pack_bufs[i]), "%s/%s/program%d/romfs",
+                             packs_dir, pnames[i], prog_idx);
+                    if (sd_dir_exists(pack_bufs[i])) {
+                        overlays[ov_cnt++] = pack_bufs[i];
+                        continue;
+                    }
+                }
+                snprintf(pack_bufs[i], sizeof(pack_bufs[i]), "%s/%s/romfs", packs_dir, pnames[i]);
+                if (sd_dir_exists(pack_bufs[i]))
+                    overlays[ov_cnt++] = pack_bufs[i];
+            }
+        }
+
+        // 2. Flat title mod folder (highest priority)
+        if (prog_idx > 0 && ov_cnt < (int)NUPVFS_MAX_LAYERS - 1) {
             snprintf(mod1, sizeof(mod1), "/kaihen/mods/%016llx/program%d/romfs",
                      (unsigned long long)g_title_id, prog_idx);
             if (sd_dir_exists(mod1)) overlays[ov_cnt++] = mod1;
         }
-        snprintf(mod2, sizeof(mod2), "/kaihen/mods/%016llx/romfs",
-                 (unsigned long long)g_title_id);
-        if (sd_dir_exists(mod2)) overlays[ov_cnt++] = mod2;
+        if (ov_cnt < (int)NUPVFS_MAX_LAYERS - 1) {
+            snprintf(mod2, sizeof(mod2), "/kaihen/mods/%016llx/romfs",
+                     (unsigned long long)g_title_id);
+            if (sd_dir_exists(mod2)) overlays[ov_cnt++] = mod2;
+        }
     }
     if (mount_romfs_via_plugin(dst, rom_root, overlays, ov_cnt, prog_idx))
         return;

@@ -62,7 +62,7 @@ typedef struct {
     u32 sd_path_off;
     u32 table_off;
     u32 hash_next;
-    u32 pad;
+    u32 deleted;
     u64 data_off;
     u64 size;
 } BuildFile;
@@ -92,6 +92,9 @@ typedef struct {
     u32 dir_path_cap;
     FsDirectoryEntry* ents;
     u32 dirs_visited;
+    u32 layer_added;
+    u32 layer_replaced;
+    u32 layer_deleted;
     bool failed;
 } RomfsBuilder;
 
@@ -183,6 +186,25 @@ static u32 builder_find_or_add_dir(RomfsBuilder* b, u32 parent_idx, const char* 
     return idx;
 }
 
+static void builder_delete_file(RomfsBuilder* b, u32 parent_idx,
+                                const char* name, u32 name_len) {
+    u32 prev = ROMFS_ENTRY_EMPTY;
+    for (u32 cur = b->dirs[parent_idx].first_file; cur != ROMFS_ENTRY_EMPTY; cur = b->files[cur].next_sibling) {
+        if (b->files[cur].name_len == name_len &&
+            memcmp(b->name_pool + b->files[cur].name_off, name, name_len) == 0) {
+            if (prev == ROMFS_ENTRY_EMPTY)
+                b->dirs[parent_idx].first_file = b->files[cur].next_sibling;
+            else
+                b->files[prev].next_sibling = b->files[cur].next_sibling;
+            b->files[cur].deleted = 1;
+            b->files[cur].next_sibling = ROMFS_ENTRY_EMPTY;
+            b->layer_deleted++;
+            return;
+        }
+        prev = cur;
+    }
+}
+
 static void builder_add_or_replace_file(RomfsBuilder* b, u32 parent_idx,
                                         const char* name, u32 name_len,
                                         const char* sd_path, u64 size, bool replace) {
@@ -199,6 +221,7 @@ static void builder_add_or_replace_file(RomfsBuilder* b, u32 parent_idx,
                 b->files[cur].sd_path_off = pool_append(&b->path_pool, &b->path_used, &b->path_cap,
                                                         sd_path, (u32)strlen(sd_path), path_lim, &b->failed);
                 b->files[cur].size = size;
+                b->layer_replaced++;
                 return;
             }
         }
@@ -225,6 +248,8 @@ static void builder_add_or_replace_file(RomfsBuilder* b, u32 parent_idx,
     f->size = size;
     f->next_sibling = b->dirs[parent_idx].first_file;
     b->dirs[parent_idx].first_file = idx;
+    if (replace)
+        b->layer_added++;
 }
 
 static void walk_sd_tree(RomfsBuilder* b, const char* root_path, bool replace) {
@@ -287,8 +312,12 @@ static void walk_sd_tree(RomfsBuilder* b, const char* root_path, bool replace) {
                     if (!b->failed)
                         stack[sp++] = (WalkWorkItem){ .dir_idx = didx, .dir_path_off = poff, .depth = it.depth + 1u };
                 } else {
-                    builder_add_or_replace_file(b, it.dir_idx, name, nlen, child_path,
-                                                (u64)b->ents[i].file_size, replace);
+                    if (replace && nlen > 5 && memcmp(name + nlen - 5, ".stub", 5) == 0) {
+                        builder_delete_file(b, it.dir_idx, name, nlen - 5);
+                    } else {
+                        builder_add_or_replace_file(b, it.dir_idx, name, nlen, child_path,
+                                                    (u64)b->ents[i].file_size, replace);
+                    }
                 }
             }
         }
@@ -336,8 +365,12 @@ bool vfsRomfsBuildLayered(VfsRomfs* r, FsFileSystem* sd,
     for (int oi = 0; oi < overlay_count && !b.failed; oi++) {
         const char* ov = overlays ? overlays[oi] : NULL;
         if (ov && ov[0] && R_SUCCEEDED(nupRawFsGetEntryType(sd, ov, &et)) && et == FsDirEntryType_Dir) {
-            nupLogf("[romfs] applying overlay layer[%d]: %s\n", oi, ov);
+            b.layer_added = 0;
+            b.layer_replaced = 0;
+            b.layer_deleted = 0;
             walk_sd_tree(&b, ov, true);
+            nupLogf("[romfs] overlay layer[%d]: %s (replaced=%u added=%u deleted=%u)\n",
+                    oi, ov, b.layer_replaced, b.layer_added, b.layer_deleted);
         }
     }
     // Free walk-only scratch buffers BEFORE allocating final RomFS metadata/spans
@@ -362,16 +395,20 @@ bool vfsRomfsBuildLayered(VfsRomfs* r, FsFileSystem* sd,
         dir_table_sz += ROMFS_DIR_HDR_SZ + align4_u32(b.dirs[i].name_len);
     }
     u32 file_table_sz = 0;
+    u32 active_files = 0;
     u64 data_cursor = 0;
     for (u32 i = 0; i < b.file_count; i++) {
+        if (b.files[i].deleted)
+            continue;
         b.files[i].table_off = file_table_sz;
         file_table_sz += ROMFS_FILE_HDR_SZ + align4_u32(b.files[i].name_len);
         b.files[i].data_off = data_cursor;
         data_cursor = align16_u64(data_cursor + b.files[i].size);
+        active_files++;
     }
 
     const u32 dir_buckets = romfs_hash_bucket_count(b.dir_count);
-    const u32 file_buckets = romfs_hash_bucket_count(b.file_count);
+    const u32 file_buckets = romfs_hash_bucket_count(active_files);
     const u64 dir_hash_off = ROMFS_HEADER_SIZE;
     const u64 dir_hash_sz = (u64)dir_buckets * 4ull;
     const u64 dir_table_off = dir_hash_off + dir_hash_sz;
@@ -381,8 +418,8 @@ bool vfsRomfsBuildLayered(VfsRomfs* r, FsFileSystem* sd,
     const u64 file_data_off = align16_u64(file_table_off + file_table_sz);
 
     u8* meta = (u8*)calloc(1, (size_t)file_data_off);
-    VfsRomfsSpan* spans = b.file_count ? (VfsRomfsSpan*)malloc((size_t)b.file_count * sizeof(VfsRomfsSpan)) : NULL;
-    if (!meta || (b.file_count && !spans)) {
+    VfsRomfsSpan* spans = active_files ? (VfsRomfsSpan*)malloc((size_t)active_files * sizeof(VfsRomfsSpan)) : NULL;
+    if (!meta || (active_files && !spans)) {
         free(meta);
         free(spans);
         free(b.dirs);
@@ -432,13 +469,18 @@ bool vfsRomfsBuildLayered(VfsRomfs* r, FsFileSystem* sd,
     u32* fhash = (u32*)(meta + file_hash_off);
     for (u32 i = 0; i < file_buckets; i++) fhash[i] = ROMFS_ENTRY_EMPTY;
     for (u32 i = 0; i < b.file_count; i++) {
+        if (b.files[i].deleted)
+            continue;
         const u32 p_off = b.dirs[b.files[i].parent_idx].table_off;
         const u32 h = romfs_calc_hash(p_off, b.name_pool + b.files[i].name_off, b.files[i].name_len) % file_buckets;
         b.files[i].hash_next = fhash[h];
         fhash[h] = b.files[i].table_off;
     }
+    u32 span_i = 0;
     for (u32 i = 0; i < b.file_count; i++) {
         const BuildFile* f = &b.files[i];
+        if (f->deleted)
+            continue;
         u8* dst = meta + file_table_off + f->table_off;
         wr32_le(dst + 0x00, b.dirs[f->parent_idx].table_off);
         wr32_le(dst + 0x04, f->next_sibling == ROMFS_ENTRY_EMPTY ? ROMFS_ENTRY_EMPTY : b.files[f->next_sibling].table_off);
@@ -448,10 +490,11 @@ bool vfsRomfsBuildLayered(VfsRomfs* r, FsFileSystem* sd,
         wr32_le(dst + 0x1C, f->name_len);
         if (f->name_len) memcpy(dst + 0x20, b.name_pool + f->name_off, f->name_len);
 
-        spans[i].data_off = f->data_off;
-        spans[i].size = f->size;
-        spans[i].path_off = f->sd_path_off;
-        spans[i].pad = 0;
+        spans[span_i].data_off = f->data_off;
+        spans[span_i].size = f->size;
+        spans[span_i].path_off = f->sd_path_off;
+        spans[span_i].pad = 0;
+        span_i++;
     }
 
     free(b.dirs);
@@ -463,8 +506,8 @@ bool vfsRomfsBuildLayered(VfsRomfs* r, FsFileSystem* sd,
     r->file_data_off = file_data_off;
     r->total_size = file_data_off + data_cursor;
     r->spans = spans;
-    r->span_count = b.file_count;
-    r->span_cap = b.file_count;
+    r->span_count = active_files;
+    r->span_cap = active_files;
     r->path_pool = b.path_pool;
     r->path_used = b.path_used;
     r->path_cap = b.path_cap;

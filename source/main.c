@@ -447,7 +447,20 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
             serviceClose(&hen);
         }
     }
-    nupSvcHipcSetVfsPlugin(vfs_h, vfs_active ? vfs_info.flags : (NUPVFS_FLAG_MODS | NUPVFS_FLAG_CACHE));
+    u32 eff_vfs_flags = vfs_active ? vfs_info.flags : (NUPVFS_FLAG_MODS | NUPVFS_FLAG_CACHE);
+    bool hold_l_vanilla = false;
+    {
+        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+        PadState launch_pad;
+        padInitializeAny(&launch_pad);
+        padUpdate(&launch_pad);
+        if (padGetButtons(&launch_pad) & HidNpadButton_L) {
+            hold_l_vanilla = true;
+            eff_vfs_flags &= ~NUPVFS_FLAG_MODS;
+        }
+    }
+    nupSvcHipcSetVfsPlugin(vfs_h, eff_vfs_flags);
+    elfSetModContext(&g_sd, entry->title_id, (eff_vfs_flags & NUPVFS_FLAG_MODS) != 0);
 
     nupDiagReset();
     nupTraceReset(trace_mode);
@@ -459,10 +472,13 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
         snprintf(log_path, sizeof(log_path), "/kaihen/nup-loader.log");
 
     nupLogInit(&g_sd, log_path);
-    nupLogf("=== nup-loader [build=" NUP_BUILD_TAG "] (%s%s): %s (tid=%016llx) ===\n",
+    nupLogf("=== nup-loader [build=" NUP_BUILD_TAG "] (%s%s%s): %s (tid=%016llx) ===\n",
             headless ? "headless" : "ui",
             trace_mode ? "+TRACE" : "",
+            hold_l_vanilla ? "+VANILLA(L)" : "",
             entry->path, (unsigned long long)entry->title_id);
+    if (hold_l_vanilla)
+        nupLogf("[mods] Hold-L detected: vanilla boot (all LayeredFS/ExeFS/IPS mods skipped)\n");
 
     if (vfs_active && (vfs_info.flags & NUPVFS_FLAG_NATIVE)) {
         char msg[0x100] = {};
