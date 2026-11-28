@@ -101,7 +101,113 @@ static bool ncm_title_has_sw2_upgrade(u64 app_id, NcmContentMetaDatabase* dbs, c
     return false;
 }
 
-static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1) {
+static u32 read_pfs0_npdm_sysres(FsFileSystem* sd, const char* path) {
+    if (!sd || !path) return 0;
+    FsFile f = {};
+    if (R_FAILED(nupRawFsOpenFile(sd, path, FsOpenMode_Read, &f)))
+        return 0;
+    u32 sysres = 0;
+    u8 hdr[0x10] = {};
+    u64 got = 0;
+    if (R_SUCCEEDED(fsFileRead(&f, 0, hdr, sizeof(hdr), FsReadOption_None, &got)) &&
+        got == sizeof(hdr) && memcmp(hdr, "PFS0", 4) == 0) {
+        u32 count = 0, str_sz = 0;
+        memcpy(&count, hdr + 4, 4);
+        memcpy(&str_sz, hdr + 8, 4);
+        if (count >= 1 && count <= 32 && str_sz > 0 && str_sz <= 0x400) {
+            const u64 data_base = 0x10ULL + (u64)count * 24ULL + str_sz;
+            u8 meta[0x20] = {};
+            for (u32 i = 0; i < count; i++) {
+                u8 ent[24] = {};
+                if (R_FAILED(fsFileRead(&f, 0x10 + (s64)i * 24, ent, 24, FsReadOption_None, &got)) || got != 24)
+                    break;
+                u64 foff = 0, fsz = 0;
+                u32 noff = 0;
+                memcpy(&foff, ent + 0, 8);
+                memcpy(&fsz, ent + 8, 8);
+                memcpy(&noff, ent + 16, 4);
+                if (noff >= str_sz || fsz < 0x20) continue;
+                char name[32] = {};
+                u64 nlen = str_sz - noff;
+                if (nlen > sizeof(name) - 1) nlen = sizeof(name) - 1;
+                if (R_SUCCEEDED(fsFileRead(&f, (s64)(0x10ULL + (u64)count * 24ULL + noff), name, nlen, FsReadOption_None, &got)) &&
+                    strcmp(name, "main.npdm") == 0) {
+                    if (R_SUCCEEDED(fsFileRead(&f, (s64)(data_base + foff), meta, sizeof(meta), FsReadOption_None, &got)) &&
+                        got == sizeof(meta) && memcmp(meta, "META", 4) == 0) {
+                        memcpy(&sysres, meta + 0x14, 4);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    fsFileClose(&f);
+    return sysres;
+}
+
+static u32 read_target_sysres(FsFileSystem* sd, const NupEntry* entry) {
+    if (!sd || !entry || !entry->path[0]) return 0;
+    static const char* const suffixes[2] = { "/game/exefs/main.npdm", "/exefs/main.npdm" };
+    for (int i = 0; i < 2; i++) {
+        char p[0x320];
+        snprintf(p, sizeof(p), "%s%s", entry->path, suffixes[i]);
+        FsFile f = {};
+        if (R_SUCCEEDED(nupRawFsOpenFile(sd, p, FsOpenMode_Read, &f))) {
+            u8 meta[0x20] = {};
+            u64 got = 0;
+            u32 sysres = 0;
+            if (R_SUCCEEDED(fsFileRead(&f, 0, meta, sizeof(meta), FsReadOption_None, &got)) &&
+                got == sizeof(meta) && memcmp(meta, "META", 4) == 0) {
+                memcpy(&sysres, meta + 0x14, 4);
+            }
+            fsFileClose(&f);
+            return sysres;
+        }
+    }
+    return 0;
+}
+
+static u32 query_title_sysres(FsFileSystem* sd, Handle ldr_root, u64 tid, u8 storage_id, u8 attr) {
+    char pol[0x80];
+    snprintf(pol, sizeof(pol), "/kaihen/bin/policy/%016llx.nsp", (unsigned long long)tid);
+    const u32 cached = read_pfs0_npdm_sysres(sd, pol);
+    if (cached > 0)
+        return cached;
+    if (ldr_root == INVALID_HANDLE)
+        return 0;
+
+    Service loader = {};
+    serviceCreate(&loader, ldr_root);
+    loader.own_handle = 0;
+    const struct {
+        u8 attributes;
+        u8 storage_id;
+        u64 program_id;
+    } req = { attr, storage_id, tid };
+    u8 code_info[0x1a4] = {};
+    FsFileSystem code_fs = {};
+    u32 sysres = 0;
+    if (R_SUCCEEDED(serviceDispatchIn(&loader, 0, req,
+            .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
+            .buffers = {{code_info, sizeof(code_info)}},
+            .out_num_objects = 1,
+            .out_objects = &code_fs.s))) {
+        FsFile npdm = {};
+        if (R_SUCCEEDED(fsFsOpenFile(&code_fs, "/main.npdm", FsOpenMode_Read, &npdm))) {
+            u8 meta[0x20] = {};
+            u64 got = 0;
+            if (R_SUCCEEDED(fsFileRead(&npdm, 0, meta, sizeof(meta), FsReadOption_None, &got)) &&
+                got == sizeof(meta) && memcmp(meta, "META", 4) == 0) {
+                memcpy(&sysres, meta + 0x14, 4);
+            }
+            fsFileClose(&npdm);
+        }
+        fsFsClose(&code_fs);
+    }
+    return sysres;
+}
+
+static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1, u32 min_sysres) {
     const u64 cfg_tid = read_donor_cfg(sd, want_sw1);
     if (cfg_tid)
         return cfg_tid;
@@ -123,6 +229,18 @@ static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1) {
     if (R_FAILED(nrc))
         return 0;
 
+    Handle ldr_root = INVALID_HANDLE;
+    {
+        Service ro = {}, hen = {};
+        if (R_SUCCEEDED(kaihenGetRoSession(&ro))) {
+            if (R_SUCCEEDED(kaihenOpenHomebrewSession(&ro, &hen))) {
+                henGetLoaderRoot(&hen, &ldr_root);
+                serviceClose(&hen);
+            }
+            serviceClose(&ro);
+        }
+    }
+
     static const NcmStorageId storages[3] = {
         NcmStorageId_SdCard,
         NcmStorageId_BuiltInUser,
@@ -134,11 +252,13 @@ static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1) {
         db_ok[s] = R_SUCCEEDED(ncmOpenContentMetaDatabase(&dbs[s], storages[s]));
 
     u64 chosen = 0;
+    u32 best_sysres = 0;
+    bool best_has_s1_nsp = false;
     u64 fallback = 0;
     NcmContentMetaKey keys[64];
 
     if (want_sw1) {
-        for (int s = 0; s < 3 && !chosen; s++) {
+        for (int s = 0; s < 3; s++) {
             if (!db_ok[s]) continue;
             s32 total = 0, written = 0;
             if (R_FAILED(ncmContentMetaDatabaseList(&dbs[s], &total, &written, keys, 64,
@@ -157,23 +277,43 @@ static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1) {
                 snprintf(s1_nsp, sizeof(s1_nsp), "/kaihen/bin/s1/%016llx.nsp",
                          (unsigned long long)keys[i].id);
                 u32 et = 0;
-                if (sd && R_SUCCEEDED(nupRawFsGetEntryType(sd, s1_nsp, &et)) && et == FsDirEntryType_File) {
+                const bool has_nsp = (sd && R_SUCCEEDED(nupRawFsGetEntryType(sd, s1_nsp, &et)) &&
+                                      et == FsDirEntryType_File);
+                const u32 sr = query_title_sysres(sd, ldr_root, keys[i].id, (u8)storages[s], 0);
+                const bool meets = (min_sysres > 0) ? (sr >= min_sysres) : (sr > 0);
+                const bool best_meets = (min_sysres > 0) ? (best_sysres >= min_sysres) : (best_sysres > 0);
+                bool better = false;
+                if (!chosen) {
+                    if (sr > 0 || has_nsp) better = true;
+                } else if (meets && !best_meets) {
+                    better = true;
+                } else if (meets == best_meets) {
+                    if (sr > best_sysres) better = true;
+                    else if (sr == best_sysres && has_nsp && !best_has_s1_nsp) better = true;
+                }
+                if (better) {
                     chosen = keys[i].id;
-                    break;
+                    best_sysres = sr;
+                    best_has_s1_nsp = has_nsp;
                 }
             }
         }
     } else {
-        // Prefer native Switch 2 (0400...) titles first
-        for (int s = 0; s < 3 && !chosen; s++) {
+        // Prefer native Switch 2 (0400...) titles with highest sysres
+        for (int s = 0; s < 3; s++) {
             if (!db_ok[s]) continue;
             s32 total = 0, written = 0;
-            if (R_SUCCEEDED(ncmContentMetaDatabaseList(&dbs[s], &total, &written, keys, 64,
+            if (R_FAILED(ncmContentMetaDatabaseList(&dbs[s], &total, &written, keys, 64,
                     NcmContentMetaType_Application, 0,
                     0x0400000000010000ULL, 0x04FFFFFFFFFFFFFFULL,
-                    NcmContentInstallType_Full)) && written > 0) {
-                chosen = keys[0].id;
-                break;
+                    NcmContentInstallType_Full)))
+                continue;
+            for (s32 i = 0; i < written; i++) {
+                const u32 sr = query_title_sysres(sd, ldr_root, keys[i].id, (u8)storages[s], 1);
+                if (!chosen || sr > best_sysres) {
+                    chosen = keys[i].id;
+                    best_sysres = sr;
+                }
             }
         }
         // Fallback: Switch 2 Edition (0100... with program1 upgrade)
@@ -195,6 +335,8 @@ static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1) {
         }
     }
 
+    if (ldr_root != INVALID_HANDLE)
+        svcCloseHandle(ldr_root);
     for (int s = 0; s < 3; s++) {
         if (db_ok[s]) ncmContentMetaDatabaseClose(&dbs[s]);
     }
@@ -208,10 +350,11 @@ static Result try_auto_donor_pivot(FsFileSystem* sd, Handle hen_sm,
                                    bool headless, char* out_msg, size_t out_msg_sz) {
     u64 host_tid = 0;
     svcGetInfo(&host_tid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+    const u32 target_sysres = read_target_sysres(sd, entry);
     const bool host_matches = want_sw1 ? ((host_tid >> 56) == 0x01u) : ((host_tid >> 56) == 0x04u);
     const u64 donor = (native_boot && host_matches)
         ? host_tid
-        : find_matching_donor(sd, hen_sm, want_sw1);
+        : find_matching_donor(sd, hen_sm, want_sw1, target_sysres);
     if (!donor) {
         if (out_msg && out_msg_sz)
             snprintf(out_msg, out_msg_sz, "No installed %s donor found (set /kaihen/donors.cfg)",
@@ -530,6 +673,37 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
                 consoleUpdate(NULL);
             }
             return prc;
+        }
+        // Same-stack sysres shortage (e.g. Sw1 donor with sysres=0 running VAM target like XCX):
+        // auto-pivot once if a higher-sysres donor (or newly cached Mount #1 policy) is available.
+        if (!g_from_once_autolaunch && (target_is_sw1 || target_is_sw2)) {
+            u64 host_sysres = 0;
+            svcGetInfo(&host_sysres, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+            const u32 target_sysres = read_target_sysres(&g_sd, entry);
+            if (target_sysres > 0 && host_sysres < target_sysres) {
+                char pol[0x80];
+                snprintf(pol, sizeof(pol), "/kaihen/bin/policy/%016llx.nsp", (unsigned long long)host_tid);
+                const u32 host_cached_sr = read_pfs0_npdm_sysres(&g_sd, pol);
+                const u64 better = find_matching_donor(&g_sd, hen_sm, target_is_sw1, target_sysres);
+                if ((better && better != host_tid) || host_cached_sr >= target_sysres) {
+                    nupLogf("[pivot] sysres upgrade: host=%016llx (0x%llx, cached=0x%x) target=0x%x -> donor=%016llx\n",
+                            (unsigned long long)host_tid, (unsigned long long)host_sysres,
+                            host_cached_sr, target_sysres,
+                            (unsigned long long)(better ? better : host_tid));
+                    char pmsg[0x100] = {};
+                    const Result prc = try_auto_donor_pivot(&g_sd, hen_sm, entry, trace_mode,
+                                                            target_is_sw1, false, headless,
+                                                            pmsg, sizeof(pmsg));
+                    if (R_SUCCEEDED(prc)) {
+                        nupLogClose();
+                        if (vfs_h != INVALID_HANDLE) svcCloseHandle(vfs_h);
+                        if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
+                        return 0;
+                    }
+                    nupLogf("[pivot] sysres upgrade failed (continuing on current donor): %s (rc=0x%x)\n",
+                            pmsg, prc);
+                }
+            }
         }
     }
 
