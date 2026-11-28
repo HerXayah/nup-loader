@@ -993,6 +993,17 @@ static u32 apply_relr(const LoadedModule* mod) {
     return applied;
 }
 
+static bool stub_sdk_mutex_is_locked(const u32* mutex) {
+    if (!mutex) return false;
+    u64 tls = 0;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tls));
+    if (!tls) return false;
+    const u8* tt = *(const u8* const*)(uintptr_t)(tls + 0x1f8);
+    if (!tt) return false;
+    const u32 cur_handle = *(const u32*)(tt + 0x1b8);
+    return cur_handle != 0 && ((*mutex & 0xbfffffffu) == cur_handle);
+}
+
 static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
                              const Elf64_Rela* table, u64 bytes,
                              SymbolHookFn hook_fn, u32* unresolved, u32* logged_unres) {
@@ -1066,6 +1077,12 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
                         addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE");
                     else if (strcmp(name, "nnosInitializeMutex") == 0)
                         addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi");
+                    else if (strcmp(name, "_ZN2nn2os12SdkMutexType4LockEv") == 0)
+                        addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5EnterEv");
+                    else if (strcmp(name, "_ZN2nn2os12SdkMutexType6UnlockEv") == 0)
+                        addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5LeaveEv");
+                    else if (strcmp(name, "_ZNK2nn2os12SdkMutexType23IsLockedByCurrentThreadEv") == 0)
+                        addr = (u64)(uintptr_t)stub_sdk_mutex_is_locked;
                     else if (strcmp(name, "__nnDetailNintendoSdkRuntimeObjectFile") == 0 ||
                              strcmp(name, "_ZN2nn5album14g_LibraryStateE") == 0)
                         addr = (u64)(uintptr_t)g_dummy_runtime_obj;
@@ -1293,29 +1310,6 @@ static bool audit_is_fs_aoc(const char* name) {
             strncmp(name, "_ZNK2nn3aoc", 11) == 0);
 }
 
-static bool audit_is_sys_api(const char* name) {
-    static const char* const pfx[] = {
-        "_ZN2nn2oe", "_ZNK2nn2oe",
-        "_ZN2nn2am", "_ZNK2nn2am",
-        "_ZN2nn2sm", "_ZNK2nn2sm",
-        "_ZN2nn2os", "_ZNK2nn2os",
-        "_ZN2nn3mem", "_ZNK2nn3mem",
-        "_ZN2nn4lmem", "_ZNK2nn4lmem",
-        "_ZN2nn2vi", "_ZNK2nn2vi",
-        "_ZN2nn2nv", "_ZNK2nn2nv",
-        "_ZN2nn7account", "_ZNK2nn7account",
-        "_ZN2nn4init", "_ZN2nn4diag",
-        "_ZN2nn6compat", "_ZN2nn2ro",
-        "nninit", "nnos", "nvn", "pfnc_nvn",
-        NULL
-    };
-    for (int i = 0; pfx[i]; i++) {
-        if (strncmp(name, pfx[i], strlen(pfx[i])) == 0)
-            return true;
-    }
-    return false;
-}
-
 static u64 audit_resolve_sym(const ModuleSet* set, const LoadedModule* mod,
                              const Elf64_Sym* sym, const char* name) {
     if (!name || !name[0])
@@ -1337,6 +1331,12 @@ static u64 audit_resolve_sym(const ModuleSet* set, const LoadedModule* mod,
             addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE");
         else if (strcmp(name, "nnosInitializeMutex") == 0)
             addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi");
+        else if (strcmp(name, "_ZN2nn2os12SdkMutexType4LockEv") == 0)
+            addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5EnterEv");
+        else if (strcmp(name, "_ZN2nn2os12SdkMutexType6UnlockEv") == 0)
+            addr = elfFindSymbolSkipCompat1(set, "_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5LeaveEv");
+        else if (strcmp(name, "_ZNK2nn2os12SdkMutexType23IsLockedByCurrentThreadEv") == 0)
+            addr = (u64)(uintptr_t)stub_sdk_mutex_is_locked;
     }
     return addr;
 }
@@ -1383,13 +1383,7 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
                 continue;
             if (hooksQueryProvider(name, NULL) != HOOK_PROV_NONE)
                 continue;
-            const bool is_fn = (type == R_AARCH64_JUMP_SLOT) ||
-                (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
-            const bool is_traced = is_fn && audit_resolve_sym(set, mod, sym, name) &&
-                                   nupTraceShouldWrap(mod->name, name);
             sum->unhooked_fs_aoc++;
-            nupLogBufferedf("  [FS/AOC-NATIVE] %-8s %s%s\n", mod->name, name,
-                            is_traced ? " [TRACED]" : "");
         } else if (pass == 2) {
             const HookProviderKind prov = hooksQueryProvider(name, NULL);
             if (prov != HOOK_PROV_NONE) {
@@ -1406,8 +1400,6 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
                 (type == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
             if (is_fn && nupTraceShouldWrap(mod->name, name)) {
                 sum->traced_count++;
-                if (audit_is_sys_api(name))
-                    nupLogBufferedf("  [TRACED] %-8s %s\n", mod->name, name);
             } else {
                 sum->native_count++;
             }
@@ -1573,7 +1565,8 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
         "TRACED IMPORTS (native SDK retained, recorded in Y Trace Launch)"
     };
     for (int pass = 0; pass < 4; pass++) {
-        nupLogBufferedf("\n--- %s ---\n", pass_titles[pass]);
+        if (pass == 0 || pass == 2)
+            nupLogBufferedf("\n--- %s ---\n", pass_titles[pass]);
         for (u32 m = 0; m < set->count; m++) {
             const LoadedModule* mod = &set->mods[m];
             const size_t bits_sz = ((size_t)mod->sym_count + 7u) / 8u;

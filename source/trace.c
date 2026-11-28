@@ -99,9 +99,12 @@ u64 nupTraceDroppedCount(void) {
 
 static bool is_noisy_symbol(const char* name) {
     static const char* const skip_substrs[] = {
-        "LockMutex", "UnlockMutex", "TryLockMutex",
+        "LockMutex", "UnlockMutex", "TryLockMutex", "IsMutexLocked",
+        "LockBusyMutex", "UnlockBusyMutex", "TryLockBusyMutex",
         "LockLightLock", "UnlockLightLock", "TryLockLightLock",
         "LockRecursiveMutex", "UnlockRecursiveMutex",
+        "SignalEvent", "ClearEvent", "TryWaitEvent",
+        "VibrationPlayer", "VibrationNode", "VibrationValue",
         "GetCurrentThread", "GetSystemTick", "ConvertToTimeSpan",
         "GetTlsValue", "SetTlsValue",
         "GetCurrentProcessorNumber",
@@ -321,35 +324,11 @@ void nupTracePollHeartbeat(u32 elapsed_ms, bool boot_phase) {
 
     const u64 cur_seq = __atomic_load_n(&g_ring_seq, __ATOMIC_ACQUIRE);
 
-    // 1. Persistent boot checkpoint drain: during early boot, batch-persist recent
-    // ring entries so even an uncatchable hardware fault leaves a trail on SD.
+    // 1. Track ring overflow counts (raw ring stays in RAM for crash/inactivity dumps;
+    // avoid dumping thousands of repetitive [tr #] lines to SD during boot).
     if (cur_seq > g_last_drained_seq) {
-        u64 start = g_last_drained_seq + 1ULL;
-        if (cur_seq - g_last_drained_seq > NUP_TRACE_RING_SIZE) {
-            const u64 lost = (cur_seq - g_last_drained_seq) - NUP_TRACE_RING_SIZE;
-            g_dropped_total += lost;
-            start = cur_seq - NUP_TRACE_RING_SIZE + 1ULL;
-            nupLogBufferedf("[trace %ums] ring overflow: dropped %llu entries (total_dropped=%llu)\n",
-                            elapsed_ms, (unsigned long long)lost, (unsigned long long)g_dropped_total);
-        }
-        if (boot_phase) {
-            u32 emitted = 0;
-            for (u64 s = start; s <= cur_seq && emitted < 64; s++) {
-                const TraceRingEntry* e = &g_ring[s & (NUP_TRACE_RING_SIZE - 1u)];
-                if (__atomic_load_n(&e->seq, __ATOMIC_ACQUIRE) != s)
-                    continue;
-                const u32 idx = e->slot_idx;
-                if (idx >= g_slot_count)
-                    continue;
-                char lr_s[64];
-                fmt_trace_addr(e->caller_lr, lr_s, sizeof(lr_s));
-                nupLogBufferedf("[tr #%llu] [%s] %s (x0=0x%llx x1=0x%llx x2=0x%llx) <- %s\n",
-                                (unsigned long long)s, g_slots[idx].mod_name, g_slots[idx].name,
-                                (unsigned long long)e->x0, (unsigned long long)e->x1,
-                                (unsigned long long)e->x2, lr_s);
-                emitted++;
-            }
-        }
+        if (cur_seq - g_last_drained_seq > NUP_TRACE_RING_SIZE)
+            g_dropped_total += (cur_seq - g_last_drained_seq) - NUP_TRACE_RING_SIZE;
         g_last_drained_seq = cur_seq;
     }
 

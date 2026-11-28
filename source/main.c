@@ -43,6 +43,225 @@ static FsFileSystem g_sd = {};
 static bool g_sd_open = false;
 static NupArchive g_nup = {};
 ModuleSet g_mods = {};
+static bool g_from_once_autolaunch = false;
+
+static u64 read_donor_cfg(FsFileSystem* sd, bool want_sw1) {
+    if (!sd) return 0;
+    FsFile f = {};
+    if (R_FAILED(nupRawFsOpenFile(sd, "/kaihen/donors.cfg", FsOpenMode_Read, &f)))
+        return 0;
+    char buf[512] = {};
+    u64 got = 0;
+    nupRawFileRead(&f, 0, buf, sizeof(buf) - 1, &got);
+    serviceClose(&f.s);
+    if (!got) return 0;
+
+    const char* key = want_sw1 ? "sw1=" : "sw2=";
+    char* line = buf;
+    while (*line) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+        if (strncmp(line, key, 4) == 0) {
+            const u64 tid = strtoull(line + 4, NULL, 16);
+            if (want_sw1 ? ((tid >> 56) == 0x01u) : ((tid >> 56) == 0x04u || (tid >> 56) == 0x01u))
+                return tid;
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return 0;
+}
+
+static bool ncm_db_key_has_sw2_program(NcmContentMetaDatabase* db, const NcmContentMetaKey* key) {
+    u8 plat = 0;
+    if (R_SUCCEEDED(ncmContentMetaDatabaseGetPlatform(db, &plat, key)) && plat != 0)
+        return true;
+    NcmContentInfo infos[16] = {};
+    s32 written = 0;
+    if (R_SUCCEEDED(ncmContentMetaDatabaseListContentInfo(db, &written, infos, 16, key, 0))) {
+        for (s32 i = 0; i < written; i++) {
+            if (infos[i].content_type == NcmContentType_Program && infos[i].id_offset > 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool ncm_title_has_sw2_upgrade(u64 app_id, NcmContentMetaDatabase* dbs, const bool* db_ok, int db_cnt) {
+    const u64 patch_id = app_id | 0x800ULL;
+    for (int d = 0; d < db_cnt; d++) {
+        if (!db_ok[d]) continue;
+        NcmContentMetaKey pkey = {};
+        if (R_SUCCEEDED(ncmContentMetaDatabaseGetLatestContentMetaKey(&dbs[d], &pkey, patch_id))) {
+            if (ncm_db_key_has_sw2_program(&dbs[d], &pkey))
+                return true;
+        }
+    }
+    return false;
+}
+
+static u64 find_matching_donor(FsFileSystem* sd, Handle hen_sm, bool want_sw1) {
+    const u64 cfg_tid = read_donor_cfg(sd, want_sw1);
+    if (cfg_tid)
+        return cfg_tid;
+
+    Result nrc = ncmInitialize();
+    if (R_FAILED(nrc) && hen_sm != INVALID_HANDLE) {
+        Handle ncm_h = INVALID_HANDLE;
+        const SmServiceName encoded = smEncodeName("ncm");
+        Service proxy = {};
+        serviceCreate(&proxy, hen_sm);
+        proxy.own_handle = 0;
+        if (R_SUCCEEDED(serviceDispatchIn(&proxy, 1, encoded,
+                .out_handle_attrs = {SfOutHandleAttr_HipcMove},
+                .out_handles = &ncm_h)) && ncm_h != INVALID_HANDLE) {
+            smAddOverrideHandle(encoded, ncm_h);
+            nrc = ncmInitialize();
+        }
+    }
+    if (R_FAILED(nrc))
+        return 0;
+
+    static const NcmStorageId storages[3] = {
+        NcmStorageId_SdCard,
+        NcmStorageId_BuiltInUser,
+        NcmStorageId_GameCard,
+    };
+    NcmContentMetaDatabase dbs[3] = {};
+    bool db_ok[3] = {};
+    for (int s = 0; s < 3; s++)
+        db_ok[s] = R_SUCCEEDED(ncmOpenContentMetaDatabase(&dbs[s], storages[s]));
+
+    u64 chosen = 0;
+    u64 fallback = 0;
+    NcmContentMetaKey keys[64];
+
+    if (want_sw1) {
+        for (int s = 0; s < 3 && !chosen; s++) {
+            if (!db_ok[s]) continue;
+            s32 total = 0, written = 0;
+            if (R_FAILED(ncmContentMetaDatabaseList(&dbs[s], &total, &written, keys, 64,
+                    NcmContentMetaType_Application, 0,
+                    0x0100000000010000ULL, 0x01FFFFFFFFFFFFFFULL,
+                    NcmContentInstallType_Full)))
+                continue;
+            for (s32 i = 0; i < written; i++) {
+                // Skip Switch 2 Edition titles (launching them boots 0400... program1)
+                if (ncm_db_key_has_sw2_program(&dbs[s], &keys[i]) ||
+                    ncm_title_has_sw2_upgrade(keys[i].id, dbs, db_ok, 3))
+                    continue;
+                if (!fallback)
+                    fallback = keys[i].id;
+                char s1_nsp[0x80];
+                snprintf(s1_nsp, sizeof(s1_nsp), "/kaihen/bin/s1/%016llx.nsp",
+                         (unsigned long long)keys[i].id);
+                u32 et = 0;
+                if (sd && R_SUCCEEDED(nupRawFsGetEntryType(sd, s1_nsp, &et)) && et == FsDirEntryType_File) {
+                    chosen = keys[i].id;
+                    break;
+                }
+            }
+        }
+    } else {
+        // Prefer native Switch 2 (0400...) titles first
+        for (int s = 0; s < 3 && !chosen; s++) {
+            if (!db_ok[s]) continue;
+            s32 total = 0, written = 0;
+            if (R_SUCCEEDED(ncmContentMetaDatabaseList(&dbs[s], &total, &written, keys, 64,
+                    NcmContentMetaType_Application, 0,
+                    0x0400000000010000ULL, 0x04FFFFFFFFFFFFFFULL,
+                    NcmContentInstallType_Full)) && written > 0) {
+                chosen = keys[0].id;
+                break;
+            }
+        }
+        // Fallback: Switch 2 Edition (0100... with program1 upgrade)
+        for (int s = 0; s < 3 && !chosen && !fallback; s++) {
+            if (!db_ok[s]) continue;
+            s32 total = 0, written = 0;
+            if (R_FAILED(ncmContentMetaDatabaseList(&dbs[s], &total, &written, keys, 64,
+                    NcmContentMetaType_Application, 0,
+                    0x0100000000010000ULL, 0x01FFFFFFFFFFFFFFULL,
+                    NcmContentInstallType_Full)))
+                continue;
+            for (s32 i = 0; i < written; i++) {
+                if (ncm_db_key_has_sw2_program(&dbs[s], &keys[i]) ||
+                    ncm_title_has_sw2_upgrade(keys[i].id, dbs, db_ok, 3)) {
+                    fallback = keys[i].id;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int s = 0; s < 3; s++) {
+        if (db_ok[s]) ncmContentMetaDatabaseClose(&dbs[s]);
+    }
+    ncmExit();
+    return chosen ? chosen : fallback;
+}
+
+static Result try_auto_donor_pivot(FsFileSystem* sd, Handle hen_sm,
+                                   const NupEntry* entry, bool trace_mode,
+                                   bool want_sw1, bool native_boot,
+                                   bool headless, char* out_msg, size_t out_msg_sz) {
+    u64 host_tid = 0;
+    svcGetInfo(&host_tid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+    const bool host_matches = want_sw1 ? ((host_tid >> 56) == 0x01u) : ((host_tid >> 56) == 0x04u);
+    const u64 donor = (native_boot && host_matches)
+        ? host_tid
+        : find_matching_donor(sd, hen_sm, want_sw1);
+    if (!donor) {
+        if (out_msg && out_msg_sz)
+            snprintf(out_msg, out_msg_sz, "No installed %s donor found (set /kaihen/donors.cfg)",
+                     want_sw1 ? "Switch 1" : "Switch 2");
+        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    }
+
+    if (!native_boot) {
+        Result wrc = nupUiWriteAutolaunchOnce(sd, entry->path, trace_mode);
+        if (R_FAILED(wrc)) {
+            if (out_msg && out_msg_sz)
+                snprintf(out_msg, out_msg_sz, "write autolaunch failed: 0x%x", wrc);
+            return wrc;
+        }
+        Service ro = {}, hen = {};
+        if (R_SUCCEEDED(kaihenGetRoSession(&ro)) &&
+            R_SUCCEEDED(kaihenOpenHomebrewSession(&ro, &hen))) {
+            serviceDispatch(&hen, HEN_CMD_CLEAR_NEXT_PACKAGE);
+            serviceDispatch(&hen, HEN_CMD_ARM_NEXT_LAUNCH);
+            serviceClose(&hen);
+        }
+    }
+
+    if (!headless) {
+        consoleClear();
+        printf("  Auto-Donor Pivot (%s)\n", want_sw1 ? "Switch 1" : "Switch 2");
+        printf("  Target: %s (%016llx)\n", entry->label, (unsigned long long)entry->title_id);
+        printf("  Donor:  %016llx\n\n", (unsigned long long)donor);
+        printf("  Switching donor automatically...\n");
+        consoleUpdate(NULL);
+    }
+
+    Result lrc = appletRequestLaunchApplication(donor, NULL);
+    nupLogf("[pivot] want_sw1=%d native=%d donor=%016llx appletRequestLaunchApplication rc=0x%x\n",
+            want_sw1 ? 1 : 0, native_boot ? 1 : 0, (unsigned long long)donor, lrc);
+    if (R_SUCCEEDED(lrc)) {
+        svcSleepThread(300000000ULL);
+        return 0;
+    }
+
+    // Never leave a stale autolaunch.txt behind on failure (would hijack next HBMenu launch)
+    if (!native_boot) {
+        nupRawFsDeleteFile(sd, "/kaihen/autolaunch.txt");
+    }
+    if (out_msg && out_msg_sz)
+        snprintf(out_msg, out_msg_sz, "%s donor %016llx auto-launch failed (0x%x); open a %s donor from HOME",
+                 want_sw1 ? "Sw1" : "Sw2", (unsigned long long)donor, lrc,
+                 want_sw1 ? "Switch 1" : "Switch 2");
+    return lrc;
+}
 
 static void cb_notify_exception_ready(void) {
     nupLogf("[6/6] nn::init::Start -> notifyExceptionHandlerReady\n");
@@ -230,15 +449,6 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     }
     nupSvcHipcSetVfsPlugin(vfs_h, vfs_active ? vfs_info.flags : (NUPVFS_FLAG_MODS | NUPVFS_FLAG_CACHE));
 
-    if (vfs_active && (vfs_info.flags & NUPVFS_FLAG_NATIVE)) {
-        char msg[0x100] = {};
-        if (R_SUCCEEDED(nupArmNativeLoaderBoot(&g_sd, entry, msg, sizeof(msg)))) {
-            if (vfs_h != INVALID_HANDLE) svcCloseHandle(vfs_h);
-            if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
-            return 0;
-        }
-    }
-
     nupDiagReset();
     nupTraceReset(trace_mode);
 
@@ -253,6 +463,59 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
             headless ? "headless" : "ui",
             trace_mode ? "+TRACE" : "",
             entry->path, (unsigned long long)entry->title_id);
+
+    if (vfs_active && (vfs_info.flags & NUPVFS_FLAG_NATIVE)) {
+        char msg[0x100] = {};
+        if (R_SUCCEEDED(nupArmNativeLoaderBoot(&g_sd, entry, msg, sizeof(msg)))) {
+            const bool want_sw1 = ((entry->title_id >> 56) == 0x01u);
+            try_auto_donor_pivot(&g_sd, hen_sm, entry, trace_mode, want_sw1, true, headless, msg, sizeof(msg));
+            nupLogClose();
+            if (vfs_h != INVALID_HANDLE) svcCloseHandle(vfs_h);
+            if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
+            return 0;
+        }
+    }
+
+    // Auto-Donor Pivot when target stack (Switch 1 0100 vs Switch 2 0400) differs from host donor
+    {
+        u64 host_tid = 0;
+        svcGetInfo(&host_tid, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+        const bool target_is_sw1 = ((entry->title_id >> 56) == 0x01u);
+        const bool target_is_sw2 = ((entry->title_id >> 56) == 0x04u);
+        const bool host_is_sw1   = ((host_tid >> 56) == 0x01u);
+        const bool host_is_sw2   = ((host_tid >> 56) == 0x04u);
+        if ((target_is_sw1 && !host_is_sw1) || (target_is_sw2 && !host_is_sw2)) {
+            nupLogf("[pivot] stack mismatch: host=%016llx target=%016llx once=%d\n",
+                    (unsigned long long)host_tid, (unsigned long long)entry->title_id,
+                    g_from_once_autolaunch ? 1 : 0);
+            char pmsg[0x100] = {};
+            Result prc = MAKERESULT(Module_Libnx, LibnxError_IncompatSysVer);
+            if (!g_from_once_autolaunch) {
+                prc = try_auto_donor_pivot(&g_sd, hen_sm, entry, trace_mode,
+                                           target_is_sw1, false, headless,
+                                           pmsg, sizeof(pmsg));
+            } else {
+                snprintf(pmsg, sizeof(pmsg), "Stack mismatch after pivot (host=%016llx vs target=%016llx)",
+                         (unsigned long long)host_tid, (unsigned long long)entry->title_id);
+            }
+            if (R_SUCCEEDED(prc)) {
+                nupLogClose();
+                if (vfs_h != INVALID_HANDLE) svcCloseHandle(vfs_h);
+                if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
+                return 0;
+            }
+            // Never fall through and crash a Sw1 game inside a Sw2 process (or vice versa)
+            nupLogf("[pivot] aborting mismatched launch: %s (rc=0x%x)\n", pmsg, prc);
+            nupLogClose();
+            if (vfs_h != INVALID_HANDLE) svcCloseHandle(vfs_h);
+            if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
+            if (!headless && pmsg[0]) {
+                printf("\n  [pivot] %s\n", pmsg);
+                consoleUpdate(NULL);
+            }
+            return prc;
+        }
+    }
 
     if (!headless) {
         consoleClear();
@@ -355,14 +618,17 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     if (!headless) {
         printf("  [5/6] Tearing down loader UI/applet & handing off...\n");
         consoleUpdate(NULL);
-        nupLogf("[5/6] tearing down console/fsdev/hid/applet\n");
+        nupLogf("[5/6] tearing down console/win/fsdev/time/hid/applet\n");
         svcSleepThread(300000000ULL);
         consoleExit(NULL);
-        fsdevUnmountDevice("sdmc");
-        hidExit();
     } else {
-        nupLogf("[5/6] headless handoff (console/vi/nv/hid never initialized), closing applet\n");
+        nupLogf("[5/6] headless handoff: tearing down __appInit win/fsdev/time/hid/applet\n");
     }
+    extern void __nx_win_exit(void);
+    __nx_win_exit();
+    fsdevUnmountAll();
+    timeExit();
+    hidExit();
 
     if (caps.target_is_switch1 && !caps.has_compat2) {
         Result gsv_rc = gsvInitialize();
@@ -377,49 +643,6 @@ static Result launch_nup(const NupEntry* entry, bool headless, bool trace_mode) 
     appletExit();
 
     log_host_process_info();
-    // Self-test patched SVC #0x29 thunk in sdk BEFORE clearing TLS or calling nn::init::Start
-    {
-        const u32 svc29_off = elfGetSdkSvc29Off();
-        const LoadedModule* sdk_mod = NULL;
-        for (u32 i = 0; i < g_mods.count; i++) {
-            if (strcmp(g_mods.mods[i].name, "sdk") == 0) { sdk_mod = &g_mods.mods[i]; break; }
-        }
-        if (sdk_mod) {
-            MemoryInfo mi0 = {}, mi1 = {}, mi2 = {};
-            u32 pi = 0;
-            svcQueryMemory(&mi0, &pi, sdk_mod->nro_base);
-            svcQueryMemory(&mi1, &pi, sdk_mod->nso_base);
-            extern void nup_svc_entry(void);
-            svcQueryMemory(&mi2, &pi, (u64)(uintptr_t)nup_svc_entry);
-            nupLogf("[self-test] sdk.nro=%016llx(t=%u p=%u sz=0x%llx) sdk.nso=%016llx(t=%u p=%u) entry=%016llx(t=%u p=%u)\n",
-                    (unsigned long long)sdk_mod->nro_base, mi0.type, mi0.perm, (unsigned long long)mi0.size,
-                    (unsigned long long)sdk_mod->nso_base, mi1.type, mi1.perm,
-                    (unsigned long long)(uintptr_t)nup_svc_entry, mi2.type, mi2.perm);
-            if (svc29_off >= 8 && (mi1.perm & Perm_R)) {
-                const u32* w = (const u32*)(uintptr_t)(sdk_mod->nso_base + svc29_off - 8);
-                nupLogf("[self-test] sdk+0x%x words: %08x %08x %08x %08x %08x %08x\n",
-                        svc29_off - 8, w[0], w[1], w[2], w[3], w[4], w[5]);
-                const u64 fn_addr = (w[0] == 0xD503245Fu && w[1] == 0xF81F0FE0u)
-                    ? (sdk_mod->nso_base + svc29_off - 8)
-                    : (w[1] == 0xF81F0FE0u ? (sdk_mod->nso_base + svc29_off - 4) : 0);
-                if (fn_addr) {
-                    nupLogf("[self-test] invoking patched sdk svcGetInfo @ %016llx...\n",
-                            (unsigned long long)fn_addr);
-                    typedef Result (*SdkGetInfoFn)(u64*, u32, Handle, u64);
-                    u64 out_val = 0;
-                    const Result trc = ((SdkGetInfoFn)(uintptr_t)fn_addr)(
-                        &out_val, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-                    nupLogf("[self-test] patched sdk svcGetInfo OK! rc=0x%x val=0x%llx\n",
-                            trc, (unsigned long long)out_val);
-                }
-            }
-            if (init_start_addr && (mi1.perm & Perm_R)) {
-                const u32* iw = (const u32*)(uintptr_t)init_start_addr;
-                nupLogf("[self-test] nn::init::Start @ %016llx words: %08x %08x %08x %08x\n",
-                        (unsigned long long)init_start_addr, iw[0], iw[1], iw[2], iw[3]);
-            }
-        }
-    }
     nupLogSetPersistentHandle(true);
     nupDiagStartHeartbeat();
     shrink_libnx_heap_for_game();
@@ -508,9 +731,11 @@ int main(int argc, char** argv) {
 
     NupEntry auto_entry = {};
     bool auto_trace = false;
+    bool from_once = false;
     if (g_sd_open &&
         (nupUiProbeArgv(&g_sd, argc, argv, &auto_entry, &auto_trace) ||
-         nupUiReadAutolaunch(&g_sd, &auto_entry, &auto_trace))) {
+         nupUiReadAutolaunch(&g_sd, &auto_entry, &auto_trace, &from_once))) {
+        g_from_once_autolaunch = from_once;
         launch_nup(&auto_entry, true, auto_trace);
         fsFsClose(&g_sd);
         return 0;
@@ -566,7 +791,22 @@ int main(int argc, char** argv) {
         if ((down & HidNpadButton_R) && g_entry_count > 0) {
             snprintf(status, sizeof(status), "Packing /kaihen/bin/game/next.nsp for Native Loader Boot...");
             nupUiDrawMenu(g_entries, g_entry_count, g_cursor, status, g_skip_note);
-            nupArmNativeLoaderBoot(&g_sd, &g_entries[g_cursor], status, sizeof(status));
+            if (R_SUCCEEDED(nupArmNativeLoaderBoot(&g_sd, &g_entries[g_cursor], status, sizeof(status)))) {
+                Handle hen_sm = INVALID_HANDLE;
+                Service ro = {}, hen = {};
+                if (R_SUCCEEDED(kaihenGetRoSession(&ro)) &&
+                    R_SUCCEEDED(kaihenOpenHomebrewSession(&ro, &hen))) {
+                    henGetServiceManager(&hen, &hen_sm);
+                    serviceClose(&hen);
+                }
+                const bool want_sw1 = ((g_entries[g_cursor].title_id >> 56) == 0x01u);
+                const Result prc = try_auto_donor_pivot(&g_sd, hen_sm, &g_entries[g_cursor],
+                                                        false, want_sw1, true, false,
+                                                        status, sizeof(status));
+                if (hen_sm != INVALID_HANDLE) svcCloseHandle(hen_sm);
+                if (R_SUCCEEDED(prc))
+                    break;
+            }
             nupUiDrawMenu(g_entries, g_entry_count, g_cursor, status, g_skip_note);
             continue;
         }

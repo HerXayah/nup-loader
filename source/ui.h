@@ -19,5 +19,6 @@ void nupUiScanAll(FsFileSystem* sd, NupEntry* entries, int* out_count,
                   char* skip_note, size_t skip_note_sz);
 void nupUiDrawMenu(const NupEntry* entries, int count, int cursor,
                    const char* status, const char* skip_note);
-bool nupUiReadAutolaunch(FsFileSystem* sd, NupEntry* out, bool* out_trace);
+bool nupUiReadAutolaunch(FsFileSystem* sd, NupEntry* out, bool* out_trace, bool* out_was_once);
+Result nupUiWriteAutolaunchOnce(FsFileSystem* sd, const char* game_path, bool trace_mode);
 bool nupUiProbeArgv(FsFileSystem* sd, int argc, char** argv, NupEntry* out, bool* out_trace);

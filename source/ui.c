@@ -116,8 +116,9 @@ void nupUiDrawMenu(const NupEntry* entries, int count, int cursor,
     consoleUpdate(NULL);
 }
 
-bool nupUiReadAutolaunch(FsFileSystem* sd, NupEntry* out, bool* out_trace) {
+bool nupUiReadAutolaunch(FsFileSystem* sd, NupEntry* out, bool* out_trace, bool* out_was_once) {
     if (out_trace) *out_trace = false;
+    if (out_was_once) *out_was_once = false;
     if (!sd) return false;
     FsFile f = {};
     if (R_FAILED(nupRawFsOpenFile(sd, "/kaihen/autolaunch.txt", FsOpenMode_Read, &f)))
@@ -134,19 +135,52 @@ bool nupUiReadAutolaunch(FsFileSystem* sd, NupEntry* out, bool* out_trace) {
     while (*end && *end != '\r' && *end != '\n') end++;
     while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '/')) end--;
     *end = '\0';
+    bool is_once = false;
+    if (strncmp(p, "once:", 5) == 0) {
+        is_once = true;
+        p += 5;
+        while (*p == ' ' || *p == '\t') p++;
+        nupRawFsDeleteFile(sd, "/kaihen/autolaunch.txt");
+    }
+    if (out_was_once) *out_was_once = is_once;
     if (strncmp(p, "trace:", 6) == 0) {
         if (out_trace) *out_trace = true;
         p += 6;
         while (*p == ' ' || *p == '\t') p++;
     }
+    if (strncmp(p, "sdmc:", 5) == 0)
+        p += 5;
     if (!p[0]) return false;
 
     memset(out, 0, sizeof(*out));
     snprintf(out->path, sizeof(out->path), "%s", p);
-    snprintf(out->label, sizeof(out->label), "%.54s", p);
+    const char* base = strrchr(p, '/');
+    snprintf(out->label, sizeof(out->label), "%.54s", (base && base[1]) ? (base + 1) : p);
     if (!nupProbeRaw(sd, p, &out->title_id, NULL, &out->exefs_count))
         return false;
     return true;
+}
+
+Result nupUiWriteAutolaunchOnce(FsFileSystem* sd, const char* game_path, bool trace_mode) {
+    if (!sd || !game_path || !game_path[0])
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    char line[0x420];
+    const int n = snprintf(line, sizeof(line), "once:%s%s\n",
+                           trace_mode ? "trace:" : "", game_path);
+    if (n <= 0 || (size_t)n >= sizeof(line))
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    nupRawFsDeleteFile(sd, "/kaihen/autolaunch.txt");
+    Result rc = nupRawFsCreateFile(sd, "/kaihen/autolaunch.txt", n, 0);
+    if (R_FAILED(rc))
+        return rc;
+    FsFile f = {};
+    rc = nupRawFsOpenFile(sd, "/kaihen/autolaunch.txt", FsOpenMode_Write, &f);
+    if (R_FAILED(rc))
+        return rc;
+    rc = nupRawFileWrite(&f, 0, line, (u64)n, FsWriteOption_Flush);
+    nupRawFileFlush(&f);
+    serviceClose(&f.s);
+    return rc;
 }
 
 bool nupUiProbeArgv(FsFileSystem* sd, int argc, char** argv, NupEntry* out, bool* out_trace) {

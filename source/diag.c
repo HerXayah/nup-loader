@@ -920,7 +920,10 @@ void nupDiagRegisterAbortObservers(void) {
 
 void nupOnBeforeInitSdkModule(void) {
     nupDiagRegisterExceptionHandler(false);
-    nupDiagRegisterAbortObservers();
+    // Do NOT call nupDiagRegisterAbortObservers() here: Switch 1 SDK initializes
+    // AbortObserverManager's tail pointer in sdk DT_INIT_ARRAY (RegisterAbortObserver
+    // before sdk DT_INIT writes to *(u64*)0 -> 2168-0002 Data Abort). It is already
+    // registered right after sdk DT_INIT via elfRunInitArrays(..., nupDiagRegisterAbortObservers).
 }
 
 void nupOnBeforeNninitStartup(void) {

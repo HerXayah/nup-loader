@@ -363,7 +363,40 @@ Result nupArmNativeLoaderBoot(FsFileSystem* sd, const NupEntry* entry,
     int max_subsdk = -1;
     u8* patched_sdk = NULL; u64 patched_sdk_sz = 0;
 
-    // Add donor signed main.npdm first
+    // Add donor signed main.npdm first, bumping unsigned META sysres (+0x14)
+    // and main stack (+0x1C) to satisfy the target game (at least 128 MiB).
+    if (npdm_sz >= 0x80 && memcmp(npdm_buf, "META", 4) == 0) {
+        u32 target_sysres = 0x8000000u; // 128 MiB floor
+        u32 target_stack  = 0x100000u;  // 1 MiB floor
+        char tnpdm_path[0x320];
+        snprintf(tnpdm_path, sizeof(tnpdm_path), "%s/exefs/main.npdm", nup.raw_root);
+        u8* tnpdm = NULL; u64 tnpdm_sz = 0;
+        if (read_sd_whole(sd, tnpdm_path, &tnpdm, &tnpdm_sz)) {
+            if (tnpdm_sz >= 0x20 && memcmp(tnpdm, "META", 4) == 0) {
+                u32 ts = 0, tst = 0;
+                memcpy(&ts, tnpdm + 0x14, 4);
+                memcpy(&tst, tnpdm + 0x1c, 4);
+                if (ts > target_sysres) target_sysres = ts;
+                if (tst > target_stack) target_stack = tst;
+            }
+            free(tnpdm);
+        }
+        const u8 flags0 = npdm_buf[0x0c];
+        const bool is64 = (flags0 & 1u) != 0;
+        const u8 as_type = (flags0 >> 1) & 7u;
+        if (is64 && (as_type == 3u || as_type == 4u)) {
+            u32 donor_sysres = 0;
+            memcpy(&donor_sysres, npdm_buf + 0x14, 4);
+            u32 want_sysres = donor_sysres > target_sysres ? donor_sysres : target_sysres;
+            want_sysres = (want_sysres + 0x1fffffu) & ~0x1fffffu;
+            if (want_sysres > 0x1fe00000u) want_sysres = 0x1fe00000u;
+            memcpy(npdm_buf + 0x14, &want_sysres, 4);
+        }
+        u32 donor_stack = 0;
+        memcpy(&donor_stack, npdm_buf + 0x1c, 4);
+        if (donor_stack < target_stack)
+            memcpy(npdm_buf + 0x1c, &target_stack, 4);
+    }
     snprintf(items[item_cnt].name, sizeof(items[0].name), "main.npdm");
     items[item_cnt].mem_buf = npdm_buf;
     items[item_cnt].size = npdm_sz;

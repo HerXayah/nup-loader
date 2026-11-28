@@ -476,24 +476,41 @@ static VfsRomfs* get_active_romfs(void) {
     return g_active_romfs.ready ? &g_active_romfs : NULL;
 }
 
+static void resolve_program_rom_dir(u32 prog_idx, char* out, size_t out_sz) {
+    out[0] = '\0';
+    if (!g_nup || !g_nup->raw_root[0])
+        return;
+    const char* app_root = g_nup->raw_app_root[0] ? g_nup->raw_app_root : g_nup->raw_root;
+    char game_dir[0x300];
+    format_sd_subpath(app_root, "game", game_dir, sizeof(game_dir));
+    const char* base = sd_dir_exists(game_dir) ? game_dir : app_root;
+    if (prog_idx == 0) {
+        format_sd_subpath(base, "romfs", out, out_sz);
+    } else {
+        char sub[32];
+        snprintf(sub, sizeof(sub), "program%u/romfs", prog_idx);
+        format_sd_subpath(base, sub, out, out_sz);
+    }
+}
+
+static void resolve_active_rom_dir(char* out, size_t out_sz) {
+    out[0] = '\0';
+    if (!g_nup || !g_nup->raw_root[0])
+        return;
+    if (g_nup->raw_romfs_root[0])
+        snprintf(out, out_sz, "%s", g_nup->raw_romfs_root);
+    else
+        format_sd_subpath(g_nup->raw_root, "romfs", out, out_sz);
+}
+
 static VfsRomfs* get_program_romfs(u32 prog_idx) {
     if (prog_idx >= MAX_PROG_ROMS || !g_nup)
         return get_active_romfs();
     nupSpinLock(&g_svc_lock);
     if (!g_prog_romfs_built[prog_idx]) {
         g_prog_romfs_built[prog_idx] = true;
-        const char* app_root = g_nup->raw_app_root[0] ? g_nup->raw_app_root : g_nup->raw_root;
-        char game_dir[0x300];
-        format_sd_subpath(app_root, "game", game_dir, sizeof(game_dir));
-        const char* base = sd_dir_exists(game_dir) ? game_dir : app_root;
         char rom_root[0x300];
-        if (prog_idx == 0) {
-            format_sd_subpath(base, "romfs", rom_root, sizeof(rom_root));
-        } else {
-            char sub[32];
-            snprintf(sub, sizeof(sub), "program%u/romfs", prog_idx);
-            format_sd_subpath(base, sub, rom_root, sizeof(rom_root));
-        }
+        resolve_program_rom_dir(prog_idx, rom_root, sizeof(rom_root));
         const bool same_active = (g_nup->raw_romfs_root[0] && strcmp(rom_root, g_nup->raw_romfs_root) == 0);
         nupSpinUnlock(&g_svc_lock);
         if (same_active)
@@ -772,6 +789,37 @@ static bool read_ipc_path(const ParsedIpc* req, u32 idx, char* out, size_t out_s
         return true;
     }
     return false;
+}
+
+static s64 fill_sd_save_info(FsSaveDataInfo* out_info, u64 max_cnt) {
+    s64 written = 0;
+    if (!out_info || max_cnt == 0 || !g_title_id)
+        return 0;
+    static const struct { const char* sub; u8 type; u16 idx; } probes[] = {
+        { "user",    1, 0 },
+        { "device",  3, 0 },
+        { "bcat",    2, 0 },
+        { "cache_0", 5, 0 },
+        { "cache_1", 5, 1 },
+        { "cache_2", 5, 2 },
+        { "cache_3", 5, 3 },
+    };
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]) && (u64)written < max_cnt; i++) {
+        char p[0x300];
+        snprintf(p, sizeof(p), "/kaihen/saves/%016llx/%s",
+                 (unsigned long long)g_title_id, probes[i].sub);
+        if (!sd_dir_exists(p))
+            continue;
+        memset(&out_info[written], 0, sizeof(FsSaveDataInfo));
+        out_info[written].save_data_id = 0x1000000000000000ull + (u64)i + 1ull;
+        out_info[written].save_data_space_id = 1; // User
+        out_info[written].save_data_type = probes[i].type;
+        out_info[written].application_id = g_title_id;
+        out_info[written].size = 0x4000000ull; // 64 MiB
+        out_info[written].save_data_index = probes[i].idx;
+        written++;
+    }
+    return written;
 }
 
 // --- Virtual Object IPC handlers (IStorage, IFileSystem, IFile, IDirectory) ---
@@ -1120,32 +1168,8 @@ static bool handle_vobj_ipc(VirtualObj* obj, u8* m, const ParsedIpc* req) {
             const u64 max_cnt = req->b_bufs[0].size / sizeof(FsSaveDataInfo);
             FsSaveDataInfo* out_info = (FsSaveDataInfo*)(uintptr_t)req->b_bufs[0].addr;
             s64 written = 0;
-            if (obj->reader_pos == 0 && max_cnt > 0 && g_title_id) {
-                // Report existing SD-backed save directories (user, device, cache_0..7)
-                static const struct { const char* sub; u8 type; u16 idx; } probes[] = {
-                    { "user",    1, 0 },
-                    { "device",  3, 0 },
-                    { "bcat",    2, 0 },
-                    { "cache_0", 5, 0 },
-                    { "cache_1", 5, 1 },
-                    { "cache_2", 5, 2 },
-                    { "cache_3", 5, 3 },
-                };
-                for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]) && (u64)written < max_cnt; i++) {
-                    char p[0x300];
-                    snprintf(p, sizeof(p), "/kaihen/saves/%016llx/%s",
-                             (unsigned long long)g_title_id, probes[i].sub);
-                    if (!sd_dir_exists(p))
-                        continue;
-                    memset(&out_info[written], 0, sizeof(FsSaveDataInfo));
-                    out_info[written].save_data_id = 0x1000000000000000ull + (u64)i + 1ull;
-                    out_info[written].save_data_space_id = 1; // User
-                    out_info[written].save_data_type = probes[i].type;
-                    out_info[written].application_id = g_title_id;
-                    out_info[written].size = 0x4000000ull; // 64 MiB
-                    out_info[written].save_data_index = probes[i].idx;
-                    written++;
-                }
+            if (obj->reader_pos == 0) {
+                written = fill_sd_save_info(out_info, max_cnt);
                 obj->reader_pos = 1;
             }
             write_cmif_reply(m, dom, 0, &written, sizeof(written), 0, INVALID_HANDLE, INVALID_HANDLE);
@@ -1365,15 +1389,8 @@ static bool handle_sm_ipc(u64* regs, Handle h, u8* m, const u8* req_buf, bool wi
             session_register(out_h, SESS_AOC);
         else if (strncmp(svc_name, "bcat:", 5) == 0)
             session_register(out_h, SESS_BCAT);
-        // Trace-only visibility: successes are silent on the normal path.
-        // Proxied services already logged above; don't log twice.
-        if (!proxied && nupTraceIsEnabled()) {
-            u8 tls_save[0x100];
-            memcpy(tls_save, armGetTls(), sizeof(tls_save));
-            nupLogf("[svc-sm] GetService('%s') -> OK (h=0x%x)\n", svc_name, out_h);
-            memcpy(armGetTls(), tls_save, sizeof(tls_save));
-        }
     }
+    (void)proxied;
 
     regs[0] = krc;
     return true;
@@ -1583,22 +1600,69 @@ static bool handle_fsp_srv_ipc(u64* regs, Handle h, TrackedSession* sess, u8* m,
         return true;
     }
 
-    // --- RomFS / DLC IStorage commands ---
-    if (req.cmd == 200u || req.cmd == 201u || req.cmd == 202u || req.cmd == 205u) {
+    // --- RomFS IFileSystem commands (cmds 2, 9, 204) ---
+    if (req.cmd == 2u || req.cmd == 9u || req.cmd == 204u) {
+        char rom_dir[0x300] = {};
+        if (req.cmd == 2u) { // OpenDataFileSystemByCurrentProcess
+            resolve_active_rom_dir(rom_dir, sizeof(rom_dir));
+        } else if (req.cmd == 204u) { // OpenDataFileSystemWithProgramIndex(u8 index)
+            const u32 pidx = req.raw_in[0];
+            resolve_program_rom_dir(pidx, rom_dir, sizeof(rom_dir));
+            if (!sd_dir_exists(rom_dir))
+                resolve_active_rom_dir(rom_dir, sizeof(rom_dir));
+        } else { // cmd 9: OpenDataFileSystemByProgramId(u64 pid)
+            const u64 pid = rd64(req.raw_in + 0);
+            if (pid == g_title_id || (g_title_id && (pid & ~0xFFFull) == (g_title_id & ~0xFFFull))) {
+                resolve_program_rom_dir((u32)(pid & 0xFu), rom_dir, sizeof(rom_dir));
+                if (!sd_dir_exists(rom_dir))
+                    resolve_active_rom_dir(rom_dir, sizeof(rom_dir));
+            } else {
+                return false; // System data: pass through
+            }
+        }
+        if (!rom_dir[0] || !sd_dir_exists(rom_dir)) {
+            write_cmif_reply(m, dom, FS_RC_TARGET_NOT_FOUND, NULL, 0, 0, INVALID_HANDLE, INVALID_HANDLE);
+            regs[0] = 0;
+            return true;
+        }
+        VirtualObj vo = {};
+        vo.kind = VOBJ_FS;
+        vo.read_only = true;
+        snprintf(vo.sd_root, sizeof(vo.sd_root), "%s", rom_dir);
+        nupLogf("[svc-fs] cmd %u (OpenDataFileSystem) -> SD '%s'\n", req.cmd, rom_dir);
+        if (dom) {
+            const u32 oid = vobj_alloc(&vo);
+            write_cmif_reply(m, true, oid ? 0 : MAKERESULT(Module_Libnx, LibnxError_OutOfMemory),
+                             NULL, 0, oid, INVALID_HANDLE, INVALID_HANDLE);
+        } else {
+            const Handle vh = vhandle_alloc(&vo);
+            write_cmif_reply(m, false, vh != INVALID_HANDLE ? 0 : MAKERESULT(Module_Libnx, LibnxError_OutOfMemory),
+                             NULL, 0, 0, vh, INVALID_HANDLE);
+        }
+        regs[0] = 0;
+        return true;
+    }
+
+    // --- RomFS / DLC IStorage commands (Switch 1 + Switch 2 aliases 210/211/212) ---
+    if (req.cmd == 200u || req.cmd == 201u || req.cmd == 202u || req.cmd == 203u ||
+        req.cmd == 205u || req.cmd == 210u || req.cmd == 211u || req.cmd == 212u) {
         VfsRomfs* r = NULL;
-        if (req.cmd == 200u) { // OpenDataStorageByCurrentProcess
+        if (req.cmd == 200u || req.cmd == 203u || req.cmd == 210u) {
+            // OpenDataStorageByCurrentProcess / OpenPatchDataStorageByCurrentProcess / Sw2 alias 210
             r = get_active_romfs();
-            nupLogf("[svc-fs] cmd 200 (OpenDataStorageByCurrentProcess) -> %s\n", r ? "SD RomFS" : "MISS");
-        } else if (req.cmd == 205u) { // OpenDataStorageWithProgramIndex(u8 prog_idx)
+            nupLogf("[svc-fs] cmd %u (OpenDataStorageByCurrentProcess) -> %s\n", req.cmd, r ? "SD RomFS" : "MISS");
+        } else if (req.cmd == 205u || req.cmd == 212u) {
+            // OpenDataStorageWithProgramIndex(u8 prog_idx) / Sw2 alias 212
             const u32 pidx = req.raw_in[0];
             r = get_program_romfs(pidx);
-            nupLogf("[svc-fs] cmd 205 (OpenDataStorageWithProgramIndex prog=%u) -> %s\n", pidx, r ? "SD RomFS" : "MISS");
-        } else if (req.cmd == 201u) { // OpenDataStorageByProgramId(u64 pid)
+            nupLogf("[svc-fs] cmd %u (OpenDataStorageWithProgramIndex prog=%u) -> %s\n", req.cmd, pidx, r ? "SD RomFS" : "MISS");
+        } else if (req.cmd == 201u || req.cmd == 211u) {
+            // OpenDataStorageByProgramId(u64 pid) / Sw2 alias 211
             const u64 pid = rd64(req.raw_in + 0);
             if (pid == g_title_id || (g_title_id && (pid & ~0xFFFull) == (g_title_id & ~0xFFFull))) {
                 r = get_program_romfs((u32)(pid & 0xFu));
-                nupLogf("[svc-fs] cmd 201 (OpenDataStorageByProgramId %016llx) -> %s\n",
-                        (unsigned long long)pid, r ? "SD RomFS" : "MISS");
+                nupLogf("[svc-fs] cmd %u (OpenDataStorageByProgramId %016llx) -> %s\n",
+                        req.cmd, (unsigned long long)pid, r ? "SD RomFS" : "MISS");
             } else {
                 return false; // System data (e.g. shared fonts / firmware archives): pass through
             }
@@ -1689,8 +1753,8 @@ static bool handle_fsp_srv_ipc(u64* regs, Handle h, TrackedSession* sess, u8* m,
         return true;
     }
 
-    // SaveDataInfoReader (cmds 57, 60, 61) -> virtual SD save enumerator
-    if (req.cmd == 57u || req.cmd == 60u || req.cmd == 61u) {
+    // SaveDataInfoReader (cmds 60, 61, 62, 68) -> virtual SD save enumerator
+    if (req.cmd == 60u || req.cmd == 61u || req.cmd == 62u || req.cmd == 68u) {
         VirtualObj vo = { .kind = VOBJ_SAVE_READER, .reader_pos = 0 };
         if (dom) {
             const u32 oid = vobj_alloc(&vo);
@@ -1705,8 +1769,20 @@ static bool handle_fsp_srv_ipc(u64* regs, Handle h, TrackedSession* sess, u8* m,
         return true;
     }
 
-    // SaveDataExtraData read/write (cmds 27, 35, 36) & SaveDataMetaFile (cmd 58) -> never touch NAND
-    if (req.cmd == 27u || req.cmd == 35u) {
+    // FindSaveDataWithFilter (cmd 67) -> B-buf FsSaveDataInfo[], out s64 count
+    if (req.cmd == 67u) {
+        s64 written = 0;
+        if (req.num_b > 0 && req.b_bufs[0].addr && req.b_bufs[0].size >= sizeof(FsSaveDataInfo)) {
+            const u64 max_cnt = req.b_bufs[0].size / sizeof(FsSaveDataInfo);
+            written = fill_sd_save_info((FsSaveDataInfo*)(uintptr_t)req.b_bufs[0].addr, max_cnt);
+        }
+        write_cmif_reply(m, dom, 0, &written, sizeof(written), 0, INVALID_HANDLE, INVALID_HANDLE);
+        regs[0] = 0;
+        return true;
+    }
+
+    // ReadSaveDataFileSystemExtraData* (cmds 57, 58, 69, 71) -> never touch NAND
+    if (req.cmd == 57u || req.cmd == 58u || req.cmd == 69u || req.cmd == 71u) {
         if (req.num_b > 0 && req.b_bufs[0].addr && req.b_bufs[0].size >= sizeof(FsSaveDataExtraData)) {
             FsSaveDataExtraData* ex = (FsSaveDataExtraData*)(uintptr_t)req.b_bufs[0].addr;
             memset(ex, 0, sizeof(*ex));
@@ -1720,46 +1796,48 @@ static bool handle_fsp_srv_ipc(u64* regs, Handle h, TrackedSession* sess, u8* m,
         regs[0] = 0;
         return true;
     }
-    if (req.cmd == 36u) {
+
+    // WriteSaveDataFileSystemExtraData* (cmds 59, 66, 70) -> never touch NAND
+    if (req.cmd == 59u || req.cmd == 66u || req.cmd == 70u) {
         write_cmif_reply(m, dom, 0, NULL, 0, 0, INVALID_HANDLE, INVALID_HANDLE);
         regs[0] = 0;
         return true;
     }
-    if (req.cmd == 58u) {
+
+    // OpenSaveDataMetaFile (cmd 80) -> not present on SD
+    if (req.cmd == 80u) {
         write_cmif_reply(m, dom, FS_RC_TARGET_NOT_FOUND, NULL, 0, 0, INVALID_HANDLE, INVALID_HANDLE);
         regs[0] = 0;
         return true;
     }
 
-    // Save / Cache management commands -> SD-backed no-ops (never touch NAND)
+    // Save / Cache create, delete, extend commands -> SD-backed no-ops (never touch NAND)
     if (req.cmd == 22u || req.cmd == 23u || req.cmd == 24u || req.cmd == 25u ||
-        req.cmd == 28u || req.cmd == 67u || req.cmd == 68u) {
+        req.cmd == 28u || req.cmd == 32u || req.cmd == 33u || req.cmd == 35u || req.cmd == 37u) {
         nupLogf("[svc-fs] cmd %u save/cache mgmt -> virtualized OK (no NAND write)\n", req.cmd);
         write_cmif_reply(m, dom, 0, NULL, 0, 0, INVALID_HANDLE, INVALID_HANDLE);
         regs[0] = 0;
         return true;
     }
-    if (req.cmd == 34u || req.cmd == 69u) { // GetCacheStorageSize
+    if (req.cmd == 34u) { // GetCacheStorageSize
         const s64 sizes[2] = { 0x80000000ll, 0x80000000ll };
         write_cmif_reply(m, dom, 0, sizes, sizeof(sizes), 0, INVALID_HANDLE, INVALID_HANDLE);
         regs[0] = 0;
         return true;
     }
-    if (req.cmd == 70u) { // GetCacheStorageMax
-        const struct { s32 max_idx; s32 pad; s64 max_sz; } out = { 16, 0, 0x80000000ll };
-        write_cmif_reply(m, dom, 0, &out, sizeof(out), 0, INVALID_HANDLE, INVALID_HANDLE);
+    if (req.cmd == 601u) { // QuerySaveDataTotalSize(s64 data, s64 journal) -> out s64 total
+        const s64 dsz = (req.raw_in_bytes >= 8) ? (s64)rd64(req.raw_in + 0) : 0;
+        const s64 jsz = (req.raw_in_bytes >= 16) ? (s64)rd64(req.raw_in + 8) : 0;
+        const s64 total = dsz + jsz + 0x100000ll;
+        write_cmif_reply(m, dom, 0, &total, sizeof(total), 0, INVALID_HANDLE, INVALID_HANDLE);
         regs[0] = 0;
         return true;
     }
-
-    // Trace-mode visibility for the silent-passthrough path (Rom mount/query etc.).
-    // Handled cmds already log above; this catches everything we decline.
-    if (nupTraceIsEnabled()) {
-        u64 w0 = 0;
-        if (req.raw_in && req.raw_in_bytes >= 8) memcpy(&w0, req.raw_in, 8);
-        nupLogf("[svc-fs] cmd=%u dom=%u dcmd=%u tipc=%u inlen=%u w0=0x%llx -> passthrough\n",
-                req.cmd, req.is_domain ? 1u : 0u, req.domain_cmd,
-                req.is_tipc ? 1u : 0u, req.raw_in_bytes, (unsigned long long)w0);
+    if (req.cmd == 612u) { // GetFreeSpaceSizeForSaveData(u8 space_id) -> out s64 free
+        const s64 free_sz = 0x40000000ll;
+        write_cmif_reply(m, dom, 0, &free_sz, sizeof(free_sz), 0, INVALID_HANDLE, INVALID_HANDLE);
+        regs[0] = 0;
+        return true;
     }
 
     // Unhandled fsp-srv command: log once per cmd id, then pass through to real FS.
@@ -1958,34 +2036,7 @@ void nupSvcHipcSetInStartup(bool in_startup) {
 
 // --- Central SVC Dispatcher (called from svc_entry.s on private 64 KiB stack) ---
 
-static volatile u32 g_svc_trace_cnt = 0;
-static volatile u64 g_svc_counts[0x40] = {0};
-
 int nupSvcDispatch(u64* regs, u32 svc_num) {
-    if (nupTraceIsEnabled()) {
-        const u32 n = __atomic_fetch_add(&g_svc_trace_cnt, 1, __ATOMIC_RELAXED);
-        if (svc_num < 0x40u)
-            __atomic_fetch_add(&g_svc_counts[svc_num], 1ULL, __ATOMIC_RELAXED);
-        if (n < 32u) {
-            u8 tls_save[0x100];
-            memcpy(tls_save, armGetTls(), sizeof(tls_save));
-            nupLogf("[svc-trace #%u] svc=0x%02x x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx\n",
-                    n, svc_num,
-                    (unsigned long long)regs[0], (unsigned long long)regs[1],
-                    (unsigned long long)regs[2], (unsigned long long)regs[3]);
-            memcpy(armGetTls(), tls_save, sizeof(tls_save));
-        } else if ((n & 0xFFFu) == 0u) {
-            // Periodic summary so nnMain-phase SVCs stay visible without per-call spam.
-            u8 tls_save[0x100];
-            memcpy(tls_save, armGetTls(), sizeof(tls_save));
-            nupLogf("[svc-trace #%u] summary 0x1F=%llu 0x21/0x22=%llu/%llu 0x29=%llu\n", n,
-                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x1Fu], __ATOMIC_RELAXED),
-                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x21u], __ATOMIC_RELAXED),
-                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x22u], __ATOMIC_RELAXED),
-                    (unsigned long long)__atomic_load_n(&g_svc_counts[0x29u], __ATOMIC_RELAXED));
-            memcpy(armGetTls(), tls_save, sizeof(tls_save));
-        }
-    }
     switch (svc_num) {
     case 0x01: { // svcSetHeapSize(out_addr: x1, size: x1_in -> x0=rc, x1=addr)
         if (!g_host_heap_keep)
@@ -2096,18 +2147,6 @@ int nupSvcDispatch(u64* regs, u32 svc_num) {
         TrackedSession snap = s ? *s : (TrackedSession){0};
         nupSpinUnlock(&g_svc_lock);
 
-        // Trace-mode visibility: log every IPC on tracked sessions pre-parse.
-        // This catches parse-failures and domain traffic that handlers decline silently.
-        if (snap.kind != SESS_NONE && nupTraceIsEnabled()) {
-            u8 tls_save[0x100];
-            memcpy(tls_save, armGetTls(), sizeof(tls_save));
-            u32 w[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-            memcpy(w, req_buf + 0, 32);
-            nupLogf("[svc-ipc] sess=%u h=0x%x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                    (unsigned)snap.kind, h, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-            memcpy(armGetTls(), tls_save, sizeof(tls_save));
-        }
-
         if (snap.kind == SESS_NONE)
             return 0;
 
@@ -2178,11 +2217,6 @@ int nupSvcDispatch(u64* regs, u32 svc_num) {
             regs[1] = val;
             return 1;
         }
-        // Trace-mode visibility: which other kernel truths does the game read?
-        // (Rom-image discovery via GetInfo/alias-region would surface here.)
-        if (nupTraceIsEnabled())
-            nupLogf("[svc-info] type=0x%x sub=0x%llx -> passthrough\n",
-                    type, (unsigned long long)sub);
         return 0;
     }
 

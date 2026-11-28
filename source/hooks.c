@@ -242,7 +242,7 @@ static u8 wrap_nvnWindowInitialize(void* w, const void* builder) {
 static u8 wrap_nvnMemoryPoolInitialize(void* pool, const void* builder) {
     const u8 ok = real_nvnMemoryPoolInitialize ? real_nvnMemoryPoolInitialize(pool, builder) : 0;
     const u32 n = __atomic_add_fetch(&g_nvn_mempool_calls, 1u, __ATOMIC_RELAXED);
-    if (!ok || n <= 16 || (n & (n - 1u)) == 0u) {
+    if (!ok || n == 1 || n == 16 || (n >= 64 && (n & (n - 1u)) == 0u)) {
         u64 gu = 0, gt = 0;
         log_gpu_remote_inline(&gu, &gt);
         nupLogf("[nvn] nvnMemoryPoolInitialize #%u -> %u%s (gpu=%llu/%llu MiB)\n",
@@ -298,10 +298,7 @@ static void wrap_nvnQueuePresentTexture(void* q, void* w, int idx) {
 static void* hook_NvnDeviceGetProcAddress(void* dev, const char* name) {
     void* fn = real_NvnDeviceGetProcAddress ? real_NvnDeviceGetProcAddress(dev, name) : NULL;
     if (nupTraceIsEnabled() && name && name[0] && fn) {
-        if (g_nvn_gpa_logs < 64) {
-            g_nvn_gpa_logs++;
-            nupLogBufferedf("  [nvn_gpa #%u] '%s' -> %p\n", g_nvn_gpa_logs, name, fn);
-        }
+        g_nvn_gpa_logs++;
         if (strcmp(name, "nvnDeviceInitialize") == 0) { real_nvnDeviceInitialize = (u8 (*)(void*, const void*))fn; return (void*)wrap_nvnDeviceInitialize; }
         if (strcmp(name, "nvnQueueInitialize") == 0) { real_nvnQueueInitialize = (u8 (*)(void*, const void*))fn; return (void*)wrap_nvnQueueInitialize; }
         if (strcmp(name, "nvnWindowInitialize") == 0) { real_nvnWindowInitialize = (u8 (*)(void*, const void*))fn; return (void*)wrap_nvnWindowInitialize; }
