@@ -54,8 +54,10 @@ jobs:
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             version="${GITHUB_REF_NAME}"
+            archive="nup-loader-${version}.zip"
           else
             version="${GITHUB_SHA}"
+            archive="nup-loader.zip"
           fi
           mkdir -p dist/stage/kaihen/programs dist/stage/kaihen/plugins dist/stage/switch/nup-loader
           cp nup-loader.nro dist/stage/kaihen/programs/nup-loader.nro
@@ -63,11 +65,12 @@ jobs:
           cp plugin/nupvfs.nso dist/stage/kaihen/plugins/nupvfs.nso
           cp nup-loader.nro dist/nup-loader.nro
           cp plugin/nupvfs.nso dist/nupvfs.nso
-          (cd dist/stage && zip -q -r -X "../nup-loader-${version}.zip" .)
+          (cd dist/stage && zip -q -r -X "../${archive}" .)
           rm -rf dist/stage
-          (cd dist && sha256sum "nup-loader-${version}.zip" nup-loader.nro nupvfs.nso > SHA256SUMS.txt)
+          (cd dist && sha256sum "$archive" nup-loader.nro nupvfs.nso > SHA256SUMS.txt)
           cat dist/SHA256SUMS.txt
           echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -84,13 +87,13 @@ jobs:
             gh release create "${GITHUB_REF_NAME}" \
               --title "nup-loader ${GITHUB_REF_NAME}" \
               --generate-notes \
-              "dist/nup-loader-${VERSION}.zip" \
+              "dist/${ARCHIVE}" \
               dist/nup-loader.nro \
               dist/nupvfs.nso \
               dist/SHA256SUMS.txt
           else
             tag="build-${GITHUB_SHA}"
-            zip="dist/nup-loader-${VERSION}.zip"
+            zip="dist/${ARCHIVE}"
             if gh release view "$tag" >/dev/null 2>&1; then
               gh release upload "$tag" --clobber \
                 "$zip" dist/nup-loader.nro dist/nupvfs.nso dist/SHA256SUMS.txt
