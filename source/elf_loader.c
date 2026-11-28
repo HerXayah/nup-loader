@@ -13,7 +13,7 @@
 typedef struct {
     s64 d_tag;
     u64 d_val;
-} Elf64_Dyn;
+} NupElf64_Dyn;
 
 typedef struct {
     u32 st_name;
@@ -22,38 +22,84 @@ typedef struct {
     u16 st_shndx;
     u64 st_value;
     u64 st_size;
-} Elf64_Sym;
+} NupElf64_Sym;
 
 typedef struct {
     u64 r_offset;
     u64 r_info;
     s64 r_addend;
-} Elf64_Rela;
+} NupElf64_Rela;
 
+#ifndef DT_NULL
 #define DT_NULL         0
+#endif
+#ifndef DT_PLTRELSZ
 #define DT_PLTRELSZ     2
+#endif
+#ifndef DT_PLTGOT
 #define DT_PLTGOT       3
+#endif
+#ifndef DT_HASH
 #define DT_HASH         4
+#endif
+#ifndef DT_STRTAB
 #define DT_STRTAB       5
+#endif
+#ifndef DT_SYMTAB
 #define DT_SYMTAB       6
+#endif
+#ifndef DT_RELA
 #define DT_RELA         7
+#endif
+#ifndef DT_RELASZ
 #define DT_RELASZ       8
+#endif
+#ifndef DT_STRSZ
 #define DT_STRSZ        10
+#endif
+#ifndef DT_INIT
 #define DT_INIT         12
+#endif
+#ifndef DT_FINI
 #define DT_FINI         13
+#endif
+#ifndef DT_JMPREL
 #define DT_JMPREL       23
+#endif
+#ifndef DT_INIT_ARRAY
 #define DT_INIT_ARRAY   25
+#endif
+#ifndef DT_INIT_ARRAYSZ
 #define DT_INIT_ARRAYSZ 27
+#endif
+#ifndef DT_RELRSZ
 #define DT_RELRSZ       35
+#endif
+#ifndef DT_RELR
 #define DT_RELR         36
+#endif
+#ifndef DT_GNU_HASH
 #define DT_GNU_HASH     0x6ffffef5
+#endif
+#ifndef DT_RELACOUNT
 #define DT_RELACOUNT    0x6ffffff9
+#endif
 
+#ifndef R_AARCH64_ABS64
 #define R_AARCH64_ABS64     257
+#endif
+#ifndef R_AARCH64_GLOB_DAT
 #define R_AARCH64_GLOB_DAT  1025
+#endif
+#ifndef R_AARCH64_JUMP_SLOT
 #define R_AARCH64_JUMP_SLOT 1026
+#endif
+#ifndef R_AARCH64_RELATIVE
 #define R_AARCH64_RELATIVE  1027
+#endif
+#ifndef R_AARCH64_TLSDESC
 #define R_AARCH64_TLSDESC   1031
+#endif
 
 // Per-thread AArch64 TLSDESC resolver: slot[1] holds base of a 64-slot (64 * 64B = 4KB)
 // region; selects a private 64-byte slot per thread by mixing bits of tpidr_el0
@@ -77,10 +123,18 @@ __asm__(
 static u8 g_tls_fallback[0x20000] __attribute__((aligned(64)));
 static u32 g_tls_cursor = 0;
 
+#ifndef ELF64_R_SYM
 #define ELF64_R_SYM(i)   ((u32)((i) >> 32))
+#endif
+#ifndef ELF64_R_TYPE
 #define ELF64_R_TYPE(i)  ((u32)((i) & 0xffffffffu))
+#endif
+#ifndef ELF64_ST_BIND
 #define ELF64_ST_BIND(i) ((i) >> 4)
+#endif
+#ifndef STB_WEAK
 #define STB_WEAK 2
+#endif
 
 static u64 page_align(u64 v) {
     return (v + 0xfff) & ~(u64)0xfff;
@@ -162,7 +216,7 @@ static bool parse_mod0(LoadedModule* mod) {
     mod->mod0_off = mod_off;
     mod->dynamic_off = (u64)((s64)mod_off + (s64)dyn_rel);
     mod->module_object_off = mod_obj_rel ? (u64)((s64)mod_off + (s64)mod_obj_rel) : 0;
-    const Elf64_Dyn* dyn = (const Elf64_Dyn*)(base + mod->dynamic_off);
+    const NupElf64_Dyn* dyn = (const NupElf64_Dyn*)(base + mod->dynamic_off);
 
     const u32* hash = NULL;
     u64 symtab_off = 0, strtab_off = 0;
@@ -197,7 +251,7 @@ static bool parse_mod0(LoadedModule* mod) {
     if (hash) {
         mod->sym_count = hash[1];
     } else if (strtab_off > symtab_off) {
-        mod->sym_count = (u32)((strtab_off - symtab_off) / sizeof(Elf64_Sym));
+        mod->sym_count = (u32)((strtab_off - symtab_off) / sizeof(NupElf64_Sym));
     }
     return true;
 }
@@ -933,7 +987,7 @@ static u32 sysv_elf_hash(const char* name) {
 static u64 lookup_in_module(const LoadedModule* mod, const char* name, bool* out_weak) {
     if (!mod || !mod->symtab || !mod->strtab || !name || !name[0])
         return 0;
-    const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
+    const NupElf64_Sym* syms = (const NupElf64_Sym*)mod->symtab;
     if (mod->gnu_hash_off && (mod->gnu_hash_off & 7u) == 0 &&
         mod->gnu_hash_off + 16u <= mod->total_size) {
         const u32* gh = (const u32*)((const u8*)(uintptr_t)mod->nso_base + mod->gnu_hash_off);
@@ -1287,12 +1341,12 @@ static bool stub_sdk_mutex_is_locked(const u32* mutex) {
 }
 
 static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
-                             const Elf64_Rela* table, u64 bytes,
+                             const NupElf64_Rela* table, u64 bytes,
                              SymbolHookFn hook_fn, u32* unresolved, u32* logged_unres) {
     if (!table || bytes == 0)
         return;
-    const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
-    const u64 count = bytes / sizeof(Elf64_Rela);
+    const NupElf64_Sym* syms = (const NupElf64_Sym*)mod->symtab;
+    const u64 count = bytes / sizeof(NupElf64_Rela);
     for (u64 i = 0; i < count; i++) {
         const u32 type = ELF64_R_TYPE(table[i].r_info);
         const u32 sym_idx = ELF64_R_SYM(table[i].r_info);
@@ -1330,7 +1384,7 @@ static void apply_rela_table(const ModuleSet* set, const LoadedModule* mod,
 
         if (sym_idx >= mod->sym_count)
             continue;
-        const Elf64_Sym* sym = &syms[sym_idx];
+        const NupElf64_Sym* sym = &syms[sym_idx];
         const char* name = (sym->st_name < mod->strsz) ? (mod->strtab + sym->st_name) : "";
         u64 addr = 0;
         bool was_hooked = false;
@@ -1555,13 +1609,13 @@ Result elfRelocateAll(ModuleSet* set, SymbolHookFn hook_fn, u32* out_unresolved)
         const u32 relr_n = apply_relr(mod);
         nupLogf("reloc %s: base=%016llx syms=%u relr=%u rela=%llu jmprel=%llu init=%016llx init_arr=%llu\n",
                 mod->name, (unsigned long long)mod->nso_base, mod->sym_count, relr_n,
-                (unsigned long long)(mod->relasz / sizeof(Elf64_Rela)),
-                (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
+                (unsigned long long)(mod->relasz / sizeof(NupElf64_Rela)),
+                (unsigned long long)(mod->pltrelsz / sizeof(NupElf64_Rela)),
                 (unsigned long long)mod->init_fn,
                 (unsigned long long)(mod->init_arraysz / sizeof(u64)));
-        apply_rela_table(set, mod, (const Elf64_Rela*)mod->rela, mod->relasz,
+        apply_rela_table(set, mod, (const NupElf64_Rela*)mod->rela, mod->relasz,
                          hook_fn, &unresolved, &logged_unres);
-        apply_rela_table(set, mod, (const Elf64_Rela*)mod->jmprel, mod->pltrelsz,
+        apply_rela_table(set, mod, (const NupElf64_Rela*)mod->jmprel, mod->pltrelsz,
                          hook_fn, &unresolved, &logged_unres);
         init_module_object(mod);
     }
@@ -1593,7 +1647,7 @@ static bool audit_is_fs_aoc(const char* name) {
 }
 
 static u64 audit_resolve_sym(const ModuleSet* set, const LoadedModule* mod,
-                             const Elf64_Sym* sym, const char* name) {
+                             const NupElf64_Sym* sym, const char* name) {
     if (!name || !name[0])
         return sym->st_shndx ? (mod->nso_base + sym->st_value) : 0;
     if (strcmp(name, "_ZN2nn2ro25LookupNextSymbolForCompatEPmPKc") == 0 ||
@@ -1624,15 +1678,15 @@ static u64 audit_resolve_sym(const ModuleSet* set, const LoadedModule* mod,
 }
 
 static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
-                                const Elf64_Rela* table, u64 bytes,
+                                const NupElf64_Rela* table, u64 bytes,
                                 u8* seen_bits, int pass, ElfAuditSummary* sum) {
     if (!table || bytes == 0 || !mod->symtab || !mod->strtab)
         return;
     const bool is_sdk = (strcmp(mod->name, "sdk") == 0);
     if (pass > 0 && is_sdk)
         return;
-    const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
-    const u64 count = bytes / sizeof(Elf64_Rela);
+    const NupElf64_Sym* syms = (const NupElf64_Sym*)mod->symtab;
+    const u64 count = bytes / sizeof(NupElf64_Rela);
     for (u64 i = 0; i < count; i++) {
         const u32 type = ELF64_R_TYPE(table[i].r_info);
         if (type != R_AARCH64_ABS64 && type != R_AARCH64_GLOB_DAT &&
@@ -1646,7 +1700,7 @@ static void audit_collect_table(const ModuleSet* set, const LoadedModule* mod,
         if (seen_bits)
             seen_bits[sidx >> 3] |= (u8)(1u << (sidx & 7));
 
-        const Elf64_Sym* sym = &syms[sidx];
+        const NupElf64_Sym* sym = &syms[sidx];
         const char* name = (sym->st_name < mod->strsz) ? (mod->strtab + sym->st_name) : "";
         if (!name[0])
             continue;
@@ -1706,11 +1760,11 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
         const u32 first_word = mod->nso_base ? *(const u32*)(uintptr_t)mod->nso_base : 0;
         const bool is_m20 = (first_word == 1 && mod->module_object_off);
         if (is_m20) sum.has_modobj20 = true;
-        sum.total_jmprel += (u32)(mod->pltrelsz / sizeof(Elf64_Rela));
+        sum.total_jmprel += (u32)(mod->pltrelsz / sizeof(NupElf64_Rela));
         u32 mod_gdat = 0, mod_tls = 0;
         if (mod->rela && mod->relasz) {
-            const Elf64_Rela* r = (const Elf64_Rela*)mod->rela;
-            const u64 rc = mod->relasz / sizeof(Elf64_Rela);
+            const NupElf64_Rela* r = (const NupElf64_Rela*)mod->rela;
+            const u64 rc = mod->relasz / sizeof(NupElf64_Rela);
             for (u64 i = 0; i < rc; i++) {
                 const u32 rt = ELF64_R_TYPE(r[i].r_info);
                 if (rt == R_AARCH64_GLOB_DAT) mod_gdat++;
@@ -1721,9 +1775,9 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
         sum.total_tlsdesc += mod_tls;
         nupLogBufferedf("  %-8s size=0x%llx syms=%u rela=%llu gdat=%u tls=%u jmprel=%llu init_arr=%llu modobj=%s%s\n",
                         mod->name, (unsigned long long)mod->total_size, mod->sym_count,
-                        (unsigned long long)(mod->relasz / sizeof(Elf64_Rela)),
+                        (unsigned long long)(mod->relasz / sizeof(NupElf64_Rela)),
                         mod_gdat, mod_tls,
-                        (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
+                        (unsigned long long)(mod->pltrelsz / sizeof(NupElf64_Rela)),
                         (unsigned long long)(mod->init_arraysz / sizeof(u64)),
                         is_m20 ? "ModObj20" : (mod->module_object_off ? "oss-rtld" : "none"),
                         mod->is_compat ? " [COMPAT]" : "");
@@ -1767,17 +1821,17 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
                 continue;
             const size_t bits_sz = ((size_t)mod->sym_count + 7u) / 8u;
             u8* seen = bits_sz ? (u8*)calloc(1, bits_sz) : NULL;
-            const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
-            const Elf64_Rela* tables[2] = { (const Elf64_Rela*)mod->jmprel, (const Elf64_Rela*)mod->rela };
+            const NupElf64_Sym* syms = (const NupElf64_Sym*)mod->symtab;
+            const NupElf64_Rela* tables[2] = { (const NupElf64_Rela*)mod->jmprel, (const NupElf64_Rela*)mod->rela };
             const u64 sizes[2] = { mod->pltrelsz, mod->relasz };
             for (int t = 0; t < 2; t++) {
                 if (!tables[t] || !sizes[t]) continue;
-                const u64 cnt = sizes[t] / sizeof(Elf64_Rela);
+                const u64 cnt = sizes[t] / sizeof(NupElf64_Rela);
                 for (u64 i = 0; i < cnt; i++) {
                     const u32 rt = ELF64_R_TYPE(tables[t][i].r_info);
                     const u32 sidx = ELF64_R_SYM(tables[t][i].r_info);
                     if (sidx >= mod->sym_count) continue;
-                    const Elf64_Sym* sym = &syms[sidx];
+                    const NupElf64_Sym* sym = &syms[sidx];
                     const bool is_fn = (rt == R_AARCH64_JUMP_SLOT) ||
                         (rt == R_AARCH64_GLOB_DAT && (sym->st_info & 0xf) == 2);
                     if (!is_fn) continue;
@@ -1825,7 +1879,7 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
             nupLogBufferedf("  %-8s [%s] discovered=YES syms=%u jmprel=%llu traceable=%s\n",
                             mod->name, mod->is_compat ? "COMPAT" : "TARGET",
                             mod->sym_count,
-                            (unsigned long long)(mod->pltrelsz / sizeof(Elf64_Rela)),
+                            (unsigned long long)(mod->pltrelsz / sizeof(NupElf64_Rela)),
                             strcmp(mod->name, "sdk") == 0 ? "NO(callee)" : "YES");
         }
         if (needs_compat && !has_c1) nupLogBufferedf("  compat1  [COMPAT] discovered=NO\n");
@@ -1853,9 +1907,9 @@ void elfRunStaticAudit(const ModuleSet* set, const NupRuntimeCapabilities* caps,
             const LoadedModule* mod = &set->mods[m];
             const size_t bits_sz = ((size_t)mod->sym_count + 7u) / 8u;
             u8* seen = bits_sz ? (u8*)calloc(1, bits_sz) : NULL;
-            audit_collect_table(set, mod, (const Elf64_Rela*)mod->jmprel, mod->pltrelsz,
+            audit_collect_table(set, mod, (const NupElf64_Rela*)mod->jmprel, mod->pltrelsz,
                                 seen, pass, &sum);
-            audit_collect_table(set, mod, (const Elf64_Rela*)mod->rela, mod->relasz,
+            audit_collect_table(set, mod, (const NupElf64_Rela*)mod->rela, mod->relasz,
                                 seen, pass, &sum);
             free(seen);
         }
@@ -1885,7 +1939,7 @@ const char* elfAddrToSymbol(const ModuleSet* set, u64 addr, u64* out_off) {
             continue;
         if (addr < mod->nso_base || addr >= mod->nso_base + mod->total_size)
             continue;
-        const Elf64_Sym* s = (const Elf64_Sym*)mod->symtab;
+        const NupElf64_Sym* s = (const NupElf64_Sym*)mod->symtab;
         for (u32 i = 1; i < mod->sym_count; i++) {
             if (!s[i].st_shndx || !s[i].st_value || s[i].st_name >= mod->strsz)
                 continue;
@@ -1926,7 +1980,7 @@ void elfLogMatchingSymbols(const ModuleSet* set, const char* substr) {
         const LoadedModule* mod = &set->mods[m];
         if (!mod->symtab || !mod->strtab)
             continue;
-        const Elf64_Sym* syms = (const Elf64_Sym*)mod->symtab;
+        const NupElf64_Sym* syms = (const NupElf64_Sym*)mod->symtab;
         for (u32 i = 0; i < mod->sym_count; i++) {
             if (syms[i].st_shndx == 0 || syms[i].st_name >= mod->strsz)
                 continue;

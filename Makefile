@@ -14,7 +14,7 @@ SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
 APP_TITLE	:=	NUP Loader
-APP_AUTHOR	:=	kaiHEN
+APP_AUTHOR	:=	Miella Selene / Xayah
 APP_VERSION	:=	0.1.0
 
 ARCH	:=	$(SWITCH2_CPU) -mtp=soft -fPIE
