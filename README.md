@@ -1,10 +1,8 @@
 # NUP Loader
 
 A standalone loader for the Nintendo Switch 2 (kaiHEN), built with devkitPro.
+Mod support untested, i dont use mods nor have any to test tbf.
 
-Currently only bootable on Fire Emblem Fortunes Weave (due to this actually needing traces from games lol.)
-
-Can also boot Pokemon Z-A Switch2 Edition.
 
 ## Install
 
