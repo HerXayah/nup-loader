@@ -28,10 +28,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Prepare ounce-devkit context (403-resilient)
+        run: |
+          git clone --depth=1 https://github.com/ouncebrew/ounce-devkit.git /tmp/ounce-devkit
+          python3 - <<'PY'
+          p = "/tmp/ounce-devkit/Dockerfile"
+          s = open(p).read()
+          assert "RUN dkp-pacman -Sy --noconfirm devkitA64 &&" in s
+          open(p, "w").write(s.replace("RUN dkp-pacman -Sy --noconfirm devkitA64 &&", "RUN (dkp-pacman -Sy --noconfirm devkitA64 || true) &&"))
+
+          p = "/tmp/ounce-devkit/install.sh"
+          s = open(p).read()
+          old = 'as_root "$PACMAN" -Sy --needed --noconfirm $overwrite $PACKAGES'
+          assert old in s
+          new = old + ' || { awk "/^\\[dkp-/{skip=1;next} /^\\[/{skip=0} !skip" "$PACMAN_CONF" > /tmp/ounce-only.conf && as_root "$PACMAN" --config /tmp/ounce-only.conf -Sy --needed --noconfirm $overwrite $PACKAGES; }'
+          open(p, "w").write(s.replace(old, new))
+          PY
+
       - name: Build ounce-devkit image (cached)
         uses: docker/build-push-action@v6
         with:
-          context: https://github.com/ouncebrew/ounce-devkit.git
+          context: /tmp/ounce-devkit
           tags: ounce-devkit:latest
           load: true
           cache-from: type=gha,scope=ounce-devkit
@@ -39,7 +56,11 @@ jobs:
 
       - name: Build nup-loader.nro and nupvfs.nso
         run: |
-          docker run --rm -v "$PWD:/src" -w /src ounce-devkit bash -euo pipefail -c '
+          git clone --depth=1 https://github.com/Doofenshmirtz-Homebrew-Incorporated/okaihen.git /tmp/okaihen
+          docker run --rm -v "$PWD:/src" -v "/tmp/okaihen:/okaihen" -w /src ounce-devkit bash -euo pipefail -c '
+            make -C /okaihen/libkaihen -j"$(nproc)"
+            cp -r /okaihen/libkaihen/include/* /opt/devkitpro/portlibs/switch2/include/
+            cp /okaihen/libkaihen/build/libkaihen.a /okaihen/libkaihen/build/libkaihen_plugin.a /opt/devkitpro/portlibs/switch2/lib/
             make -j"$(nproc)"
             make -C plugin -j"$(nproc)"
           '
